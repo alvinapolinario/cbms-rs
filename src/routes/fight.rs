@@ -108,7 +108,7 @@ async fn fight_history(state: &Arc<AppState>) -> Value {
     };
 
     let matches = sqlx::query_as::<_, Fight>(
-        "SELECT * FROM matches WHERE event_id = ? ORDER BY match_id DESC",
+        "SELECT * FROM matches WHERE event_id = ? ORDER BY match_number DESC",
     )
     .bind(event_id)
     .fetch_all(&state.db)
@@ -147,6 +147,47 @@ pub async fn get_started_app(State(state): State<Arc<AppState>>, admin: AuthedAd
         crate::services::realtime::teller_balances(&state, event_id).await;
     }
     Json(result).into_response()
+}
+
+/// Public read of the active event's current fight and history. The TV pages poll this.
+/// Unlike `fight_history`, this does not open a placeholder fight.
+pub async fn tv_board(State(state): State<Arc<AppState>>) -> Response {
+    let Some(event_id) = active_event_id(&state).await else {
+        return Json(json!({
+            "success": false,
+            "message": "No active event",
+            "event": null,
+            "match": null,
+            "matches": []
+        }))
+        .into_response();
+    };
+    let event_name: Option<String> = sqlx::query_scalar("SELECT event_name FROM events WHERE event_id = ?")
+        .bind(event_id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+    let current = sqlx::query_as::<_, Fight>(
+        "SELECT * FROM matches WHERE event_id = ? ORDER BY match_number DESC LIMIT 1",
+    )
+    .bind(event_id)
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten();
+    let matches = sqlx::query_as::<_, Fight>("SELECT * FROM matches WHERE event_id = ? ORDER BY match_number DESC")
+        .bind(event_id)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+    Json(json!({
+        "success": true,
+        "event": { "event_id": event_id, "event_name": event_name },
+        "match": current,
+        "matches": matches,
+    }))
+    .into_response()
 }
 
 /// `GET /tv/get-started`. Public in `web.php`, so this route does not require a token.
@@ -269,19 +310,15 @@ pub async fn get_latest_match_teller(State(state): State<Arc<AppState>>, _teller
 }
 
 async fn resum_totals(conn: &mut sqlx::MySqlConnection, match_id: i32) -> Result<(Money, Money), sqlx::Error> {
-    let meron: Option<Money> = sqlx::query_scalar(
-        "SELECT SUM(bet_amount) FROM bets WHERE match_id = ? AND bet_side = 'Meron' AND bet_status = 1",
+    let row = sqlx::query(
+        "SELECT CAST(COALESCE(SUM(CASE WHEN bet_side = 'Meron' THEN bet_amount END), 0) AS DECIMAL(16,2)) AS meron,
+                CAST(COALESCE(SUM(CASE WHEN bet_side = 'Wala' THEN bet_amount END), 0) AS DECIMAL(16,2)) AS wala
+         FROM bets WHERE match_id = ? AND bet_status = 1",
     )
     .bind(match_id)
     .fetch_one(&mut *conn)
     .await?;
-    let wala: Option<Money> = sqlx::query_scalar(
-        "SELECT SUM(bet_amount) FROM bets WHERE match_id = ? AND bet_side = 'Wala' AND bet_status = 1",
-    )
-    .bind(match_id)
-    .fetch_one(&mut *conn)
-    .await?;
-    Ok((meron.unwrap_or(Money::ZERO), wala.unwrap_or(Money::ZERO)))
+    Ok((row.try_get("meron")?, row.try_get("wala")?))
 }
 
 #[derive(Deserialize)]
@@ -296,7 +333,7 @@ enum Side {
 
 /// Shared body of `toggleMeron`/`toggleWala` -- identical in the PHP source apart from which
 /// bet-status flag flips.
-async fn toggle_side(state: &Arc<AppState>, match_id: i32, side: Side) -> Response {
+async fn toggle_side(state: &Arc<AppState>, account_id: i32, match_id: i32, side: Side) -> Response {
     let Some(guard) = fetch_fight(state, match_id).await else {
         return fail(StatusCode::NOT_FOUND, "Fight not found.");
     };
@@ -366,7 +403,7 @@ async fn toggle_side(state: &Arc<AppState>, match_id: i32, side: Side) -> Respon
     };
     crate::services::transactions::create_log(
         &mut *tx,
-        0,
+        account_id,
         "Admin App",
         &format!("Matches - Fight #{} Toggled the Bet Side Status of {side_name}.", guard.match_number),
     )
@@ -376,26 +413,24 @@ async fn toggle_side(state: &Arc<AppState>, match_id: i32, side: Side) -> Respon
         return AppError::internal(e).into_response();
     }
 
-    if let Some(event_id) = sqlx::query_scalar::<_, i32>("SELECT event_id FROM matches WHERE match_id = ?")
-        .bind(match_id)
-        .fetch_optional(&state.db)
-        .await
-        .ok()
-        .flatten()
-    {
-        crate::services::realtime::latest_match_updated(state, event_id).await;
-        crate::services::realtime::fight_history(state, event_id).await;
-    }
+    // The button already knows the new lock. Publish after the response so this click
+    // does not wait to reload every fight.
+    let event_id = guard.event_id;
+    let broadcast = Arc::clone(state);
+    tokio::spawn(async move {
+        crate::services::realtime::latest_match_updated(&broadcast, event_id).await;
+        crate::services::realtime::fight_history(&broadcast, event_id).await;
+    });
 
     Json(json!({ "message": format!("{side_name} bet toggled!") })).into_response()
 }
 
-pub async fn toggle_meron(State(state): State<Arc<AppState>>, _admin: AuthedAdmin, crate::extract::JsonOrForm(body): crate::extract::JsonOrForm<MatchIdRequest>) -> Response {
-    toggle_side(&state, body.match_id, Side::Meron).await
+pub async fn toggle_meron(State(state): State<Arc<AppState>>, admin: AuthedAdmin, crate::extract::JsonOrForm(body): crate::extract::JsonOrForm<MatchIdRequest>) -> Response {
+    toggle_side(&state, admin.account_id, body.match_id, Side::Meron).await
 }
 
-pub async fn toggle_wala(State(state): State<Arc<AppState>>, _admin: AuthedAdmin, crate::extract::JsonOrForm(body): crate::extract::JsonOrForm<MatchIdRequest>) -> Response {
-    toggle_side(&state, body.match_id, Side::Wala).await
+pub async fn toggle_wala(State(state): State<Arc<AppState>>, admin: AuthedAdmin, crate::extract::JsonOrForm(body): crate::extract::JsonOrForm<MatchIdRequest>) -> Response {
+    toggle_side(&state, admin.account_id, body.match_id, Side::Wala).await
 }
 
 #[derive(Deserialize)]
@@ -587,35 +622,6 @@ pub async fn update_match_status(
     }
 
     if is_correction {
-        let later_settled: bool = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM matches WHERE event_id = ? AND match_status IN ('Completed','Draw','Cancelled') AND match_id > ?",
-        )
-        .bind(target.event_id)
-        .bind(target.match_id)
-        .fetch_one(&state.db)
-        .await
-        .unwrap_or(0)
-            > 0;
-        if later_settled {
-            return fail(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                &format!("Fight #{} is locked: only the latest settled fight can be corrected.", target.match_number),
-            );
-        }
-        let paid: bool = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM claims JOIN bets ON bets.bet_id = claims.bet_id WHERE bets.match_id = ?",
-        )
-        .bind(target.match_id)
-        .fetch_one(&state.db)
-        .await
-        .unwrap_or(0)
-            > 0;
-        if paid {
-            return fail(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                &format!("Fight #{} already has payouts, so its result can no longer be changed. Report this as an incident.", target.match_number),
-            );
-        }
         body.dont_create = true;
     }
 

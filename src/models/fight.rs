@@ -28,7 +28,9 @@ pub struct Fight {
     pub match_winner: String,
     pub meron_total_bet: Money,
     pub wala_total_bet: Money,
+    #[serde(serialize_with = "crate::services::odds::serialize_odds")]
     pub meron_odds: f32,
+    #[serde(serialize_with = "crate::services::odds::serialize_odds")]
     pub wala_odds: f32,
     pub match_status: String,
     pub match_bet_status: String,

@@ -565,6 +565,40 @@ pub struct EventIdBody {
     pub event_id: i32,
 }
 
+/// Cash desk payload the website used to receive over websockets: tellers on the event,
+/// plus that event's cash-in and cash-out rows.
+pub async fn cash_board(
+    State(state): State<Arc<AppState>>,
+    _admin: AuthedAdmin,
+    JsonOrForm(body): JsonOrForm<EventIdBody>,
+) -> Response {
+    let tellers = sqlx::query(
+        "SELECT event_teller_id, event_id, teller_id, teller_name, teller_balance, teller_match_balance,
+                contact_number, is_active
+         FROM event_tellers_view WHERE event_id = ? ORDER BY teller_name ASC",
+    )
+    .bind(body.event_id)
+    .fetch_all(&state.db)
+    .await;
+    let cash_ins = sqlx::query("SELECT * FROM cash_ins_view WHERE event_id = ? ORDER BY cash_in_id DESC")
+        .bind(body.event_id)
+        .fetch_all(&state.db)
+        .await;
+    let cash_outs = sqlx::query("SELECT * FROM cash_outs_view WHERE event_id = ? ORDER BY cash_out_id DESC")
+        .bind(body.event_id)
+        .fetch_all(&state.db)
+        .await;
+    match (tellers, cash_ins, cash_outs) {
+        (Ok(tellers), Ok(cash_ins), Ok(cash_outs)) => Json(json!({
+            "tellers": strip_secrets(rows_to_json(&tellers)),
+            "cash_ins": strip_secrets(rows_to_json(&cash_ins)),
+            "cash_outs": strip_secrets(rows_to_json(&cash_outs)),
+        }))
+        .into_response(),
+        _ => db_fail_msg(),
+    }
+}
+
 /// `EventController@getData`, the teller-transactions summary.
 pub async fn teller_tx_data(
     State(state): State<Arc<AppState>>,
@@ -1369,6 +1403,15 @@ fn denom_total(row: &sqlx::mysql::MySqlRow) -> f64 {
         + piece("denom_10", 10.0)
         + piece("denom_5", 5.0)
         + piece("denom_1", 1.0)
+}
+
+fn strip_secrets(mut rows: Vec<Value>) -> Vec<Value> {
+    for row in &mut rows {
+        if let Value::Object(map) = row {
+            map.remove("password");
+        }
+    }
+    rows
 }
 
 fn db_fail(err: sqlx::Error) -> Response {

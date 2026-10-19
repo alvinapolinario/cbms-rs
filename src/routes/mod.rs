@@ -79,6 +79,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/matches/new-match", get(fight::new_match))
         .route("/matches/get-started", get(fight::get_started_web_admin))
         .route("/tv/get-started", get(fight::get_started_web))
+        .route("/tv/board", get(fight::tv_board))
         // Print service. Header X-Print-Key, same paths the FastAPI client calls.
         .route("/print-service/events", get(print_api::events))
         .route("/print-service/tellers", get(print_api::tellers))
@@ -99,6 +100,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/accounts/tellers/find/{teller_id}", post(desk::teller_find))
         .route("/accounts/tellers/{teller_id}/clear-phone-uid", post(desk::teller_clear_phone))
         .route("/accounts/tellers/{teller_id}", axum::routing::delete(desk::teller_delete))
+        .route("/cash-transactions/board", post(desk::cash_board))
         .route("/cash-transactions/cash-in", post(desk::cash_in_store))
         .route("/cash-transactions/cash-in/approve", post(desk::cash_in_approve))
         .route("/cash-transactions/cash-in/decline", post(desk::cash_in_decline))

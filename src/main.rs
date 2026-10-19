@@ -13,6 +13,7 @@ mod types;
 use axum::{routing::get, Json, Router};
 use serde_json::json;
 use std::sync::Arc;
+use tower_http::services::ServeDir;
 
 pub struct AppState {
     pub db: db::DbPool,
@@ -43,9 +44,13 @@ async fn main() -> anyhow::Result<()> {
     // Laravel's RouteServiceProvider prefixes every routes/api.php route with `/api`
     // (`->prefix('api')`) -- every real client (mobile/desktop apps) calls e.g.
     // `/api/login-app`, not `/login-app`. Matched here so those clients work unmodified.
+    let web_root = std::env::var("WEB_ROOT").unwrap_or_else(|_| "web".to_string());
+    tracing::info!("serving admin ui from {web_root}");
+
     let app = Router::new()
         .route("/health", get(health))
         .nest("/api", routes::router())
+        .fallback_service(ServeDir::new(&web_root))
         .with_state(state);
 
     tracing::info!("sabonglara-rs listening on {addr}");

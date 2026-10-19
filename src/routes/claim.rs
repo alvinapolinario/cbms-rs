@@ -4,6 +4,8 @@
 //! tables) with a couple of fields bolted on -- confirmed against the actual source, not assumed
 //! from the pattern used elsewhere.
 
+use chrono::Datelike;
+
 use crate::auth::AuthedTeller;
 use crate::extract::JsonOrForm;
 use crate::models::Fight;

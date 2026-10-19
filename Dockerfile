@@ -23,11 +23,13 @@ RUN apt-get update \
     && rm -f /etc/nginx/sites-enabled/default
 
 COPY --from=builder /app/target/release/sabonglara-rs /usr/local/bin/sabonglara-rs
+COPY web /srv/web
 COPY docker/nginx.conf /etc/nginx/sites-enabled/default
 COPY docker/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 
 ENV HOST=0.0.0.0
 ENV PORT=8080
+ENV WEB_ROOT=/srv/web
 
 EXPOSE 80
 
