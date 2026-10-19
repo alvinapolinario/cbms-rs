@@ -1,0 +1,34 @@
+[package]
+name = "sabonglara-rs"
+version = "0.1.0"
+edition = "2021"
+default-run = "sabonglara-rs"
+
+[[bin]]
+name = "sabonglara-rs"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.7", features = ["ws", "macros"] }
+serde_qs = "0.13"
+tokio = { version = "1", features = ["full"] }
+sqlx = { version = "0.7", features = ["mysql", "runtime-tokio-rustls", "chrono", "rust_decimal", "macros"] }
+rust_decimal = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+dotenvy = "0.15"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+bcrypt = "0.15"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+uuid = { version = "1", features = ["v4"] }
+thiserror = "1"
+anyhow = "1"
+async-trait = "0.1"
+
+[dev-dependencies]
