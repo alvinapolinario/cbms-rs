@@ -126,6 +126,7 @@ pub async fn store(State(state): State<Arc<AppState>>, admin: AuthedAdmin, crate
                 &format!("Event - Event created. event_id={}", res.last_insert_id()),
             )
             .await;
+            crate::services::realtime::event_updated(&state, res.last_insert_id() as i32).await;
             plain_text("1")
         }
         Err(e) => {
@@ -205,6 +206,7 @@ pub async fn update(State(state): State<Arc<AppState>>, admin: AuthedAdmin, crat
                 &format!("Event - Event updated. event_id={}", body.uid),
             )
             .await;
+            crate::services::realtime::event_updated(&state, body.uid).await;
             plain_text("1")
         }
         Err(e) => {

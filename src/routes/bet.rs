@@ -18,10 +18,6 @@ use serde_json::{json, Value};
 use sqlx::Row;
 use std::sync::Arc;
 
-fn validation_fail(message: &str) -> Response {
-    (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({ "success": false, "message": message }))).into_response()
-}
-
 /// Matches the `$fail` closure in `BetController@store`: rolls back and returns 200 with
 /// `{success:false,...}` (not an HTTP error status).
 fn soft_fail(message: &str) -> Response {
@@ -41,15 +37,9 @@ pub async fn create_bet(
     crate::extract::JsonOrForm(body): crate::extract::JsonOrForm<CreateBetRequest>,
 ) -> Response {
     if body.side != "Meron" && body.side != "Wala" {
-        return validation_fail("The selected side is invalid.");
+        return soft_fail("Invalid bet side");
     }
     let amount = body.amount.round2();
-    if amount.value() < state.config.bet_min || amount.value() > state.config.bet_max {
-        return validation_fail(&format!(
-            "The amount must be between {} and {}.",
-            state.config.bet_min, state.config.bet_max
-        ));
-    }
 
     let mut tx = match state.db.begin().await {
         Ok(tx) => tx,
@@ -76,7 +66,7 @@ pub async fn create_bet(
     // Lock the one open+ongoing fight for this event; bets on it are serialized by this lock.
     let match_row = sqlx::query(
         "SELECT * FROM matches WHERE event_id = ? AND match_bet_status = 'Open' AND match_status = 'Ongoing'
-         ORDER BY match_id DESC LIMIT 1 FOR UPDATE",
+         ORDER BY match_number DESC LIMIT 1 FOR UPDATE",
     )
     .bind(event_id)
     .fetch_optional(&mut *tx)
@@ -119,12 +109,15 @@ pub async fn create_bet(
         return soft_fail("Your account is not activated! Please contact administrator!");
     }
 
-    // The apps send the fight's match_id; older clients send its match_number.
-    if fight_match_id != body.match_id && fight_match_number != body.match_id {
+    // Sabong2026 compares this field to match_number, even though the JSON key is match_id.
+    if fight_match_number != body.match_id {
         return soft_fail("Fight is already lapsed or not existing");
     }
 
-    if (body.side == "Meron" && fight_meron_bet_status == 1) || (body.side == "Wala" && fight_wala_bet_status == 1) {
+    // Side lock 1 disables that side. A teller named "special" is exempt (BetController@store).
+    let side_locked = (body.side == "Meron" && fight_meron_bet_status == 1)
+        || (body.side == "Wala" && fight_wala_bet_status == 1);
+    if side_locked && tel_teller_name != "special" {
         return soft_fail(&format!("{} bet is currently disabled", body.side));
     }
 
@@ -238,8 +231,8 @@ pub async fn create_bet(
         Err(e) => return soft_fail(&format!("{e}")),
     };
 
-    // TODO(realtime): broadcast MatchUpdated + TellerBalanceUpdated once the Pusher-trigger
-    // client exists (docs/WORKFLOW.md section 9).
+    crate::services::realtime::match_updated(&state, fight_match_id).await;
+    crate::services::realtime::teller_balances(&state, event_id).await;
 
     let receipt = BetReceipt {
         bet,
@@ -409,8 +402,8 @@ pub async fn void_bet(
         return soft_fail(&format!("{e}"));
     }
 
-    // TODO(realtime): broadcast TellerBalanceUpdated + MatchUpdated once the Pusher-trigger
-    // client exists (docs/WORKFLOW.md section 9).
+    crate::services::realtime::teller_balances(&state, teller.event_id).await;
+    crate::services::realtime::match_updated(&state, bet_match_id).await;
 
     let bet_view = sqlx::query("SELECT * FROM bets_view WHERE bet_id = ?")
         .bind(bet_id)
@@ -556,21 +549,23 @@ pub async fn reprint_admin(
 /// `POST /bet-history` -- mirrors `BetController@betHistory`. Bare array, no envelope (matches
 /// the real source).
 pub async fn bet_history(State(state): State<Arc<AppState>>, teller: AuthedTeller) -> Response {
-    let bets = sqlx::query("SELECT * FROM bets_view WHERE event_teller_id = ? AND event_status = 'Active' ORDER BY bet_datetime DESC")
-        .bind(teller.event_teller_id)
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
-    Json(bets.iter().map(bet_view_row_to_json).collect::<Vec<_>>()).into_response()
+    ongoing_bets(&state, teller.event_teller_id).await
 }
 
 /// `POST /bet-history-ongoing` -- mirrors `BetController@betHistoryOngoing`.
+/// The Laravel method applies the same filters as `betHistory`.
 pub async fn bet_history_ongoing(State(state): State<Arc<AppState>>, teller: AuthedTeller) -> Response {
-    let bets = sqlx::query("SELECT * FROM bets_view WHERE event_teller_id = ? AND match_status = 'Ongoing' ORDER BY bet_datetime DESC")
-        .bind(teller.event_teller_id)
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
+    ongoing_bets(&state, teller.event_teller_id).await
+}
+
+async fn ongoing_bets(state: &Arc<AppState>, event_teller_id: i32) -> Response {
+    let bets = sqlx::query(
+        "SELECT * FROM bets_view WHERE event_teller_id = ? AND event_status = 'Active' AND match_status = 'Ongoing' ORDER BY bet_datetime DESC",
+    )
+    .bind(event_teller_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
     Json(bets.iter().map(bet_view_row_to_json).collect::<Vec<_>>()).into_response()
 }
 
@@ -578,7 +573,8 @@ pub async fn bet_history_ongoing(State(state): State<Arc<AppState>>, teller: Aut
 pub async fn unclaimed_receipts(State(state): State<Arc<AppState>>, teller: AuthedTeller) -> Response {
     let bets = sqlx::query(
         "SELECT * FROM bets_view WHERE event_teller_id = ? AND bet_payout_amount > 0 AND event_status = 'Active'
-         AND bet_status = 1 AND bet_payout_by IS NULL ORDER BY bet_datetime DESC",
+         AND bet_status = 1 AND match_status IN ('Draw', 'Cancelled') AND bet_payout_by IS NULL
+         ORDER BY bet_datetime DESC",
     )
     .bind(teller.event_teller_id)
     .fetch_all(&state.db)

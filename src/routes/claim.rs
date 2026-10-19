@@ -24,6 +24,13 @@ fn soft_fail(message: &str) -> Response {
     Json(json!({ "success": false, "message": message })).into_response()
 }
 
+/// `date('F j, Y h:i a')` from `ClaimController@claimWinning`, for example
+/// `October 19, 2026 10:05 am`.
+fn php_claim_stamp(dt: chrono::NaiveDateTime) -> String {
+    let ampm = if dt.format("%p").to_string().eq_ignore_ascii_case("AM") { "am" } else { "pm" };
+    format!("{} {}, {} {} {ampm}", dt.format("%B"), dt.day(), dt.format("%Y"), dt.format("%I:%M"))
+}
+
 #[derive(Deserialize)]
 pub struct ReceiptCodeRequest {
     pub receipt_code: String,
@@ -69,15 +76,21 @@ pub async fn claim_winning(
         return soft_fail("This receipt cannot be processed for payout. Please contact the administrator for assistance.");
     }
 
-    let event_status: Option<String> = sqlx::query_scalar(
-        "SELECT ev.event_status FROM event_tellers et JOIN events ev ON ev.event_id = et.event_id WHERE et.event_teller_id = ?",
+    let issuer: Option<(String, String)> = sqlx::query_as(
+        "SELECT teller_name, event_status FROM event_tellers_view WHERE event_teller_id = ?",
     )
     .bind(bet_event_teller_id)
     .fetch_optional(&mut *tx)
     .await
     .ok()
     .flatten();
-    if event_status.as_deref() != Some("Active") {
+    if bet_event_teller_id != teller.event_teller_id {
+        let name = issuer.as_ref().map(|(n, _)| n.as_str()).unwrap_or("");
+        return soft_fail(&format!(
+            "Payout unsuccessful. Please advise the bettor to claim this receipt from {name}"
+        ));
+    }
+    if issuer.as_ref().map(|(_, status)| status.as_str()) != Some("Active") {
         return soft_fail("This receipt is not eligible for payout as the event is no longer active.");
     }
 
@@ -90,7 +103,7 @@ pub async fn claim_winning(
     if let Some((teller_name, claim_datetime)) = already_claimed {
         return soft_fail(&format!(
             "This receipt was already claimed by {teller_name} on {}",
-            claim_datetime.0.format("%B %-d, %Y %I:%M %p")
+            php_claim_stamp(claim_datetime.0)
         ));
     }
 
@@ -148,13 +161,11 @@ pub async fn claim_winning(
         .await
         .ok()
         .flatten();
-    let cross_teller = bet_event_teller_id != teller.event_teller_id;
     let note = if bet_is_winner == 1 {
         format!("{bet_side} win")
     } else {
         format!("{} refund", match_status.clone().unwrap_or_else(|| "Refund".to_string()))
     };
-    let note = if cross_teller { format!("{note}; receipt issued by another teller") } else { note };
 
     if let Err(e) = ledger::record(
         &mut tx,
@@ -191,7 +202,7 @@ pub async fn claim_winning(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": format!("{e}") }))).into_response();
     }
 
-    // TODO(realtime): broadcast TellerBalanceUpdated once the Pusher-trigger client exists.
+    crate::services::realtime::teller_balances(&state, teller.event_id).await;
 
     let bet = sqlx::query_as::<_, crate::models::Bet>("SELECT * FROM bets WHERE bet_id = ?")
         .bind(bet_id)

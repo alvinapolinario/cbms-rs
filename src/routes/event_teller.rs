@@ -274,10 +274,6 @@ async fn update_tellers_inner(
         q.execute(&mut *tx).await?;
     }
 
-    // TODO(realtime): broadcast CashInUpdated once the Pusher-trigger client exists
-    // (docs/WORKFLOW.md section 9) -- out of scope for this pass, doesn't affect this
-    // endpoint's own HTTP response.
-
     create_log(
         &mut *tx,
         actor_account_id,
@@ -287,6 +283,9 @@ async fn update_tellers_inner(
     .await;
 
     tx.commit().await?;
+    crate::services::realtime::teller_balances(state, event_id).await;
+    crate::services::realtime::cash_ins(state, event_id).await;
+    crate::services::realtime::cash_outs(state, event_id).await;
     Ok(())
 }
 
@@ -311,7 +310,7 @@ pub async fn get_data_teller(State(state): State<Arc<AppState>>, teller: AuthedT
     };
 
     let event_id: i32 = row.get("event_id");
-    let latest_match = sqlx::query("SELECT match_id, match_number, match_bet_status, meron_bet_status, wala_bet_status FROM matches WHERE event_id = ? ORDER BY match_id DESC LIMIT 1")
+    let latest_match = sqlx::query("SELECT match_id, match_number, match_bet_status FROM matches WHERE event_id = ? ORDER BY match_number DESC LIMIT 1")
         .bind(event_id)
         .fetch_optional(&state.db)
         .await
@@ -322,8 +321,6 @@ pub async fn get_data_teller(State(state): State<Arc<AppState>>, teller: AuthedT
             "match_id": m.get::<i32, _>("match_id"),
             "match_number": m.get::<i32, _>("match_number"),
             "match_bet_status": m.get::<String, _>("match_bet_status"),
-            "meron_bet_status": m.get::<i8, _>("meron_bet_status"),
-            "wala_bet_status": m.get::<i8, _>("wala_bet_status"),
         }),
         None => Value::Null,
     };
@@ -351,13 +348,8 @@ pub async fn get_data_teller(State(state): State<Arc<AppState>>, teller: AuthedT
     .into_response()
 }
 
-async fn sum_or_zero(pool: &crate::db::DbPool, sql: &str, event_teller_id: i32) -> Value {
-    let sum: Option<Money> = sqlx::query_scalar(sql).bind(event_teller_id).fetch_one(pool).await.unwrap_or(None);
-    sum.map(|m| json!(m)).unwrap_or(json!(0))
-}
-
-/// `POST /event-tellers-admin` -- mirrors `EventTellerController@listTellersAdmin` +
-/// `attachTellerAckTotals`.
+/// `POST /event-tellers-admin` -- mirrors `EventTellerController@listTellersAdmin`.
+/// The rows are `event_tellers_view` for the active event, ordered by teller name.
 pub async fn list_tellers_admin(State(state): State<Arc<AppState>>, _admin: AuthedAdmin) -> Response {
     let event_id: Option<i32> = sqlx::query_scalar("SELECT event_id FROM events WHERE event_status = 'Active' LIMIT 1")
         .fetch_optional(&state.db)
@@ -374,55 +366,30 @@ pub async fn list_tellers_admin(State(state): State<Arc<AppState>>, _admin: Auth
         .await
         .unwrap_or_default();
 
-    let mut tellers = Vec::with_capacity(rows.len());
-    for row in rows {
-        let event_teller_id: i32 = row.get("event_teller_id");
-        let total_bet = sum_or_zero(
-            &state.db,
-            "SELECT SUM(bet_amount) FROM bets_view WHERE event_teller_id = ? AND bet_status = 1 AND match_status <> 'Draw' AND match_status <> 'Cancelled'",
-            event_teller_id,
-        )
-        .await;
-        let total_payout = sum_or_zero(&state.db, "SELECT SUM(claim_amount) FROM claims WHERE event_teller_id = ?", event_teller_id).await;
-        let total_cash_in = sum_or_zero(
-            &state.db,
-            "SELECT SUM(cash_in_amount) FROM cash_ins_view WHERE event_teller_id = ? AND cash_in_status = 'Approved'",
-            event_teller_id,
-        )
-        .await;
-        let total_cash_out = sum_or_zero(
-            &state.db,
-            "SELECT SUM(cash_out_amount) FROM cash_outs_view WHERE event_teller_id = ? AND cash_out_status = 'Approved'",
-            event_teller_id,
-        )
-        .await;
-
-        let teller_balance: Money = row.get("teller_balance");
-        let teller_match_balance: Money = row.get("teller_match_balance");
-        tellers.push(json!({
-            "event_teller_id": event_teller_id,
-            "event_id": row.get::<i32, _>("event_id"),
-            "teller_id": row.get::<i32, _>("teller_id"),
-            "teller_balance": teller_balance,
-            "teller_match_balance": teller_match_balance,
-            "event_name": row.get::<String, _>("event_name"),
-            "event_description": row.get::<String, _>("event_description"),
-            "event_date": row.get::<chrono::NaiveDate, _>("event_date"),
-            "event_status": row.get::<String, _>("event_status"),
-            "account_id": row.get::<i32, _>("account_id"),
-            "teller_name": row.get::<String, _>("teller_name"),
-            "contact_number": row.get::<String, _>("contact_number"),
-            "phone_uid": row.get::<String, _>("phone_uid"),
-            "username": row.get::<String, _>("username"),
-            "account_type": row.get::<String, _>("account_type"),
-            "is_active": row.get::<i8, _>("is_active"),
-            "account_date_created": row.get::<DbDateTime, _>("account_date_created"),
-            "total_bet": total_bet,
-            "total_payout": total_payout,
-            "total_cash_in": total_cash_in,
-            "total_cash_out": total_cash_out,
-        }));
-    }
+    let tellers: Vec<_> = rows
+        .iter()
+        .map(|row| {
+            json!({
+                "event_teller_id": row.get::<i32, _>("event_teller_id"),
+                "event_id": row.get::<i32, _>("event_id"),
+                "teller_id": row.get::<i32, _>("teller_id"),
+                "teller_balance": row.get::<Money, _>("teller_balance"),
+                "teller_match_balance": row.get::<Money, _>("teller_match_balance"),
+                "event_name": row.get::<String, _>("event_name"),
+                "event_description": row.get::<String, _>("event_description"),
+                "event_date": row.get::<chrono::NaiveDate, _>("event_date"),
+                "event_status": row.get::<String, _>("event_status"),
+                "account_id": row.get::<i32, _>("account_id"),
+                "teller_name": row.get::<String, _>("teller_name"),
+                "contact_number": row.get::<String, _>("contact_number"),
+                "phone_uid": row.get::<String, _>("phone_uid"),
+                "username": row.get::<String, _>("username"),
+                "account_type": row.get::<String, _>("account_type"),
+                "is_active": row.get::<i8, _>("is_active"),
+                "account_date_created": row.get::<DbDateTime, _>("account_date_created"),
+            })
+        })
+        .collect();
 
     Json(json!({ "success": true, "tellers": tellers })).into_response()
 }

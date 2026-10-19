@@ -190,4 +190,11 @@ mod tests {
         assert_eq!(Money(199.99).floor().value(), 199.0);
         assert_eq!(Money(200.0).floor().value(), 200.0);
     }
+
+    #[test]
+    fn winning_payout_is_floor_of_amount_times_odds() {
+        // MatchController@updateMatchStatus: floor($bet->bet_amount * $odds)
+        assert_eq!((100.0_f64 * 1.395).floor(), 139.0);
+        assert_eq!((10.0_f64 * 1.99).floor(), 19.0);
+    }
 }

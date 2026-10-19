@@ -12,3 +12,9 @@ pub fn verify_password(plain: &str, hash: &str) -> bool {
     };
     bcrypt::verify(plain, &normalized).unwrap_or(false)
 }
+
+/// `Hash::make` default cost (10). The stored prefix may be `$2b$`; `verify_password` accepts
+/// both that and PHP's `$2y$`.
+pub fn hash_password(plain: &str) -> Result<String, bcrypt::BcryptError> {
+    bcrypt::hash(plain, 10)
+}

@@ -1,7 +1,11 @@
-//! Bearer-token auth (docs/WORKFLOW.md section 5, mechanism 2 -- `CheckAccountToken` parity).
-//! `personal_access_tokens` (Sanctum's table) is reused purely as a hashed-token store;
-//! Sanctum's own guard is never involved. `tokenable_type` is literally the string
-//! `'EventAdmin'`/`'EventTeller'`, `tokenable_id` is `admin_id`/`event_teller_id`.
+//! Bearer-token auth for the teller and admin apps.
+//!
+//! Sabong2026 writes the plaintext `Str::random(60)` value into `personal_access_tokens.token`
+//! (`name` is `teller-token` or `admin-token`) and does not set `expires_at`. Its
+//! `account.token` middleware is currently a no-op. This API still requires the bearer token,
+//! and it looks that plaintext value up, so a token minted by Laravel login works here and a
+//! token minted here works against Laravel logout. This API looks the plaintext value up.
+//! Sanctum's hashed-token guard is not used.
 
 use crate::db::DbPool;
 use crate::error::AppError;
@@ -9,16 +13,15 @@ use crate::models::{TOKENABLE_TYPE_ADMIN, TOKENABLE_TYPE_TELLER};
 use crate::AppState;
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
-use chrono::{Duration, Utc};
+use chrono::Utc;
 use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 const TOKEN_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
-/// Matches PHP's `Str::random(60)` in spirit (a 60-char random string); the exact character
-/// generation algorithm doesn't need to match PHP's since each side only ever has to recognize
-/// tokens *it* minted via their SHA-256 hash, never reproduce PHP's own token bytes.
+/// 60-character alphanumeric string, the same shape as Laravel `Str::random(60)`.
+/// The value is stored as plaintext, so either app can look up a token the other minted.
 pub fn generate_token() -> String {
     let mut rng = rand::thread_rng();
     (0..60)
@@ -33,25 +36,23 @@ pub fn hash_token(token: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Inserts a new token row and returns the plaintext token (only ever returned to the client
-/// once, at login -- never stored anywhere, matching the Laravel behavior).
+/// Inserts a plaintext token row the way `AccountController@loginApp` / `loginAppAdmin` do,
+/// and returns that same string to the client.
 pub async fn mint_token(
     pool: &DbPool,
     tokenable_type: &str,
     tokenable_id: i32,
-    token_hours: i64,
+    name: &str,
 ) -> Result<String, sqlx::Error> {
     let plain = generate_token();
-    let hashed = hash_token(&plain);
-    let expires_at = Utc::now().naive_utc() + Duration::hours(token_hours);
     sqlx::query(
-        "INSERT INTO personal_access_tokens (tokenable_type, tokenable_id, name, token, abilities, expires_at, created_at, updated_at)
-         VALUES (?, ?, 'api', ?, '[\"*\"]', ?, NOW(), NOW())",
+        "INSERT INTO personal_access_tokens (tokenable_type, tokenable_id, name, token, abilities, created_at, updated_at)
+         VALUES (?, ?, ?, ?, '[\"*\"]', NOW(), NOW())",
     )
     .bind(tokenable_type)
     .bind(tokenable_id)
-    .bind(&hashed)
-    .bind(expires_at)
+    .bind(name)
+    .bind(&plain)
     .execute(pool)
     .await?;
     Ok(plain)
@@ -60,9 +61,8 @@ pub async fn mint_token(
 /// Deletes a token row outright (matching `AccountController@logoutApp`'s "logout deletes the
 /// token, it doesn't merely expire it" behavior).
 pub async fn revoke_token(pool: &DbPool, plain_token: &str) -> Result<(), sqlx::Error> {
-    let hashed = hash_token(plain_token);
     sqlx::query("DELETE FROM personal_access_tokens WHERE token = ?")
-        .bind(hashed)
+        .bind(plain_token)
         .execute(pool)
         .await?;
     Ok(())
@@ -101,15 +101,13 @@ async fn log_denied(pool: &DbPool, path: &str, reason: &str, token_id: Option<u6
 }
 
 async fn resolve_token(pool: &DbPool, plain: &str) -> Result<ResolvedToken, AppError> {
-    let hashed = hash_token(plain);
-    // personal_access_tokens is Sanctum's own migration, which declares last_used_at/expires_at
-    // as `timestamp` (not `datetime` like the rest of this schema) -- sqlx's MySQL driver treats
-    // the two wire types as distinct for decode purposes, so this needs `DateTime<Utc>`, not the
-    // `NaiveDateTime`-based `DbDateTime` used everywhere else.
+    // `expires_at` is a Sanctum `timestamp`. sqlx's MySQL driver will not decode that as
+    // `NaiveDateTime`, so this column stays `DateTime<Utc>`. Sabong2026 leaves it NULL.
+    // A non-null value is still honored so an older row cannot be used past its expiry.
     let row = sqlx::query_as::<_, (u64, String, u64, Option<chrono::DateTime<Utc>>)>(
         "SELECT id, tokenable_type, tokenable_id, expires_at FROM personal_access_tokens WHERE token = ?",
     )
-    .bind(&hashed)
+    .bind(plain)
     .fetch_optional(pool)
     .await
     .map_err(AppError::internal)?;

@@ -28,7 +28,7 @@ pub async fn get_data(State(state): State<Arc<AppState>>, admin: AuthedAdmin) ->
         .ok()
         .flatten();
 
-    let latest_match = sqlx::query("SELECT match_id, match_number, match_bet_status FROM matches WHERE event_id = ? ORDER BY match_id DESC LIMIT 1")
+    let latest_match = sqlx::query("SELECT match_id, match_number, match_bet_status FROM matches WHERE event_id = ? ORDER BY match_number DESC LIMIT 1")
         .bind(event_id)
         .fetch_optional(&state.db)
         .await

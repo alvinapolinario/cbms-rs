@@ -84,14 +84,8 @@ pub async fn login_app(
     let teller_name: String = row.get("teller_name");
 
     if !crate::auth::verify_password(&body.password, &password_hash) {
-        create_log(
-            db,
-            acc_account_id,
-            "Teller App",
-            &format!("Failed Login by Teller {teller_name} using device UID: {}, reason incorrect password!", body.phone_uid),
-        )
-        .await;
-        return fail(StatusCode::UNAUTHORIZED, "Incorrect password. Please contact the administrator for assistance.");
+        create_log(db, -1, "Teller App", &format!("Login attempt by Username: {}", body.username)).await;
+        return fail(StatusCode::UNAUTHORIZED, "Invalid credentials! Please contact administrator!");
     }
 
     if !event_active {
@@ -150,12 +144,12 @@ async fn teller_login_response(state: &Arc<AppState>, row: sqlx::mysql::MySqlRow
     let teller_id: i32 = row.get("teller_id");
     let event_id: i32 = row.get("event_id");
 
-    let token = match mint_token(db, "EventTeller", event_teller_id, state.config.api_token_hours).await {
+    let token = match mint_token(db, "EventTeller", event_teller_id, "teller-token").await {
         Ok(t) => t,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "message": format!("{e}") }))).into_response(),
     };
 
-    let latest_match = sqlx::query("SELECT match_id, match_number, match_bet_status, meron_bet_status, wala_bet_status FROM matches WHERE event_id = ? ORDER BY match_id DESC LIMIT 1")
+    let latest_match = sqlx::query("SELECT match_id, match_number, match_bet_status FROM matches WHERE event_id = ? ORDER BY match_number DESC LIMIT 1")
         .bind(event_id)
         .fetch_optional(db)
         .await
@@ -167,8 +161,6 @@ async fn teller_login_response(state: &Arc<AppState>, row: sqlx::mysql::MySqlRow
             "match_id": m.get::<i32, _>("match_id"),
             "match_number": m.get::<i32, _>("match_number"),
             "match_bet_status": m.get::<String, _>("match_bet_status"),
-            "meron_bet_status": m.get::<i8, _>("meron_bet_status"),
-            "wala_bet_status": m.get::<i8, _>("wala_bet_status"),
         }),
         None => Value::Null,
     };
@@ -244,19 +236,19 @@ pub async fn login_app_admin(
 
     let password_hash: String = account.get("password");
     if !crate::auth::verify_password(&body.password, &password_hash) {
-        create_log(db, account_id, "Admin App", &format!("Failed Login by Admin {admin_name}, reason incorrect password!")).await;
-        return fail(StatusCode::UNAUTHORIZED, "Incorrect password. Please contact the administrator for assistance.");
+        create_log(db, -1, "Admin App", &format!("Login attempt by Username: {}", body.username)).await;
+        return fail(StatusCode::UNAUTHORIZED, "Invalid credentials! Please contact administrator");
     }
 
     let admin_id: i32 = account.get("admin_id");
     let event_id: i32 = event.get("event_id");
 
-    let token = match mint_token(db, "EventAdmin", admin_id, state.config.api_token_hours).await {
+    let token = match mint_token(db, "EventAdmin", admin_id, "admin-token").await {
         Ok(t) => t,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "message": format!("{e}") }))).into_response(),
     };
 
-    let latest_match = sqlx::query("SELECT match_id, match_number, match_bet_status FROM matches WHERE event_id = ? ORDER BY match_id DESC LIMIT 1")
+    let latest_match = sqlx::query("SELECT match_id, match_number, match_bet_status FROM matches WHERE event_id = ? ORDER BY match_number DESC LIMIT 1")
         .bind(event_id)
         .fetch_optional(db)
         .await
@@ -291,8 +283,6 @@ pub async fn login_app_admin(
 
     let admin_json = admin_row_to_json(&account);
     let event_json = event_row_to_json(&event);
-
-    create_log(db, account_id, "Admin App", &format!("Login by Admin {admin_name}")).await;
 
     Json(json!({
         "cash_out": cash_out_json,
@@ -345,9 +335,9 @@ pub async fn logout(State(state): State<Arc<AppState>>, headers: axum::http::Hea
         return fail(StatusCode::BAD_REQUEST, "Token not found");
     };
 
-    let hashed = hash_token(token.trim());
+    let plain = token.trim();
     let existing = sqlx::query("SELECT id FROM personal_access_tokens WHERE token = ?")
-        .bind(&hashed)
+        .bind(plain)
         .fetch_optional(&state.db)
         .await
         .ok()
@@ -358,7 +348,7 @@ pub async fn logout(State(state): State<Arc<AppState>>, headers: axum::http::Hea
     }
 
     let _ = sqlx::query("DELETE FROM personal_access_tokens WHERE token = ?")
-        .bind(&hashed)
+        .bind(plain)
         .execute(&state.db)
         .await;
 
@@ -516,14 +506,6 @@ pub async fn change_password(
     teller: AuthedTeller,
     JsonOrForm(body): JsonOrForm<ChangePasswordRequest>,
 ) -> Response {
-    if body.new_password.chars().count() < 4 || body.new_password.chars().count() > 100 {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({ "message": "The new password field must be between 4 and 100 characters." })),
-        )
-            .into_response();
-    }
-
     let hashed = match bcrypt::hash(&body.new_password, bcrypt::DEFAULT_COST) {
         Ok(h) => h,
         Err(e) => {

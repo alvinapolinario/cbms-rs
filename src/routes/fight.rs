@@ -82,7 +82,7 @@ async fn fight_history(state: &Arc<AppState>) -> Value {
     };
 
     let latest = sqlx::query_as::<_, Fight>(
-        "SELECT * FROM matches WHERE event_id = ? ORDER BY match_id DESC LIMIT 1",
+        "SELECT * FROM matches WHERE event_id = ? ORDER BY match_number DESC LIMIT 1",
     )
     .bind(event_id)
     .fetch_optional(&state.db)
@@ -141,7 +141,95 @@ pub async fn get_started_app(State(state): State<Arc<AppState>>, admin: AuthedAd
         "Matches - Clicked the Get Started button.",
     )
     .await;
+    if let Some(event_id) = active_event_id(&state).await {
+        crate::services::realtime::latest_match_updated(&state, event_id).await;
+        crate::services::realtime::fight_history(&state, event_id).await;
+        crate::services::realtime::teller_balances(&state, event_id).await;
+    }
     Json(result).into_response()
+}
+
+/// `GET /tv/get-started`. Public in `web.php`, so this route does not require a token.
+pub async fn get_started_web(State(state): State<Arc<AppState>>) -> Response {
+    let _ = fight_history(&state).await;
+    if let Some(event_id) = active_event_id(&state).await {
+        crate::services::realtime::latest_match_updated(&state, event_id).await;
+        crate::services::realtime::fight_history(&state, event_id).await;
+        crate::services::realtime::teller_balances(&state, event_id).await;
+        crate::services::transactions::create_log(
+            &state.db,
+            -1,
+            "Web App",
+            "Matches - Clicked the Get Started button.",
+        )
+        .await;
+    }
+    StatusCode::OK.into_response()
+}
+
+pub async fn get_started_web_admin(State(state): State<Arc<AppState>>, admin: AuthedAdmin) -> Response {
+    let _ = fight_history(&state).await;
+    if let Some(event_id) = active_event_id(&state).await {
+        crate::services::realtime::latest_match_updated(&state, event_id).await;
+        crate::services::realtime::fight_history(&state, event_id).await;
+        crate::services::realtime::teller_balances(&state, event_id).await;
+        crate::services::transactions::create_log(
+            &state.db,
+            admin.account_id,
+            "Web App",
+            "Matches - Clicked the Get Started button.",
+        )
+        .await;
+    }
+    StatusCode::OK.into_response()
+}
+
+/// `MatchController@newMatch`: next fight, betting Open, every teller's match balance reset.
+pub async fn new_match(State(state): State<Arc<AppState>>, _admin: AuthedAdmin) -> Response {
+    let Some(event_id) = active_event_id(&state).await else {
+        return (StatusCode::OK, "0").into_response();
+    };
+    let mut tx = match state.db.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return (StatusCode::OK, "0").into_response(),
+    };
+    if sqlx::query("UPDATE event_tellers SET teller_match_balance = 0 WHERE event_id = ?")
+        .bind(event_id)
+        .execute(&mut *tx)
+        .await
+        .is_err()
+    {
+        return (StatusCode::OK, "0").into_response();
+    }
+    let prev_number: Option<i32> = sqlx::query_scalar(
+        "SELECT match_number FROM matches WHERE event_id = ? ORDER BY match_number DESC LIMIT 1",
+    )
+    .bind(event_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .ok()
+    .flatten();
+    let next_number = prev_number.unwrap_or(0) + 1;
+    let inserted = sqlx::query(
+        "INSERT INTO matches
+            (event_id, match_number, match_winner, meron_total_bet, wala_total_bet, meron_odds, wala_odds,
+             meron_bet_status, wala_bet_status, match_bet_status, match_status, match_created_datetime, is_display)
+         VALUES (?, ?, '', 0, 0, 0, 0, 0, 0, 'Open', 'Ongoing', NOW(), 0)",
+    )
+    .bind(event_id)
+    .bind(next_number)
+    .execute(&mut *tx)
+    .await;
+    let Ok(inserted) = inserted else {
+        return (StatusCode::OK, "0").into_response();
+    };
+    let match_id = inserted.last_insert_id() as i32;
+    if tx.commit().await.is_err() {
+        return (StatusCode::OK, "0").into_response();
+    }
+    crate::services::realtime::match_updated(&state, match_id).await;
+    crate::services::realtime::teller_balances(&state, event_id).await;
+    (StatusCode::OK, next_number.to_string()).into_response()
 }
 
 async fn get_latest_match_inner(state: &Arc<AppState>) -> Response {
@@ -149,7 +237,7 @@ async fn get_latest_match_inner(state: &Arc<AppState>) -> Response {
         return Json(json!({ "success": false })).into_response();
     };
     let latest = sqlx::query_as::<_, Fight>(
-        "SELECT * FROM matches WHERE event_id = ? ORDER BY match_id DESC LIMIT 1",
+        "SELECT * FROM matches WHERE event_id = ? ORDER BY match_number DESC LIMIT 1",
     )
     .bind(event_id)
     .fetch_optional(&state.db)
@@ -164,8 +252,6 @@ async fn get_latest_match_inner(state: &Arc<AppState>) -> Response {
         "match_id": m.match_id,
         "match_number": m.match_number,
         "match_bet_status": m.match_bet_status,
-        "meron_bet_status": m.meron_bet_status,
-        "wala_bet_status": m.wala_bet_status,
     }))
     .into_response()
 }
@@ -290,8 +376,16 @@ async fn toggle_side(state: &Arc<AppState>, match_id: i32, side: Side) -> Respon
         return AppError::internal(e).into_response();
     }
 
-    // TODO(realtime): broadcast TVDisplayUpdated + MatchUpdated once the Pusher-trigger client
-    // exists (docs/WORKFLOW.md section 9).
+    if let Some(event_id) = sqlx::query_scalar::<_, i32>("SELECT event_id FROM matches WHERE match_id = ?")
+        .bind(match_id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten()
+    {
+        crate::services::realtime::latest_match_updated(state, event_id).await;
+        crate::services::realtime::fight_history(state, event_id).await;
+    }
 
     Json(json!({ "message": format!("{side_name} bet toggled!") })).into_response()
 }
@@ -432,6 +526,9 @@ pub async fn update_match_bet_status(
     if let Err(e) = tx.commit().await {
         return AppError::internal(e).into_response();
     }
+
+    crate::services::realtime::match_updated(&state, body.match_id).await;
+    crate::services::realtime::tv_display(&state, body.match_id).await;
 
     Json(json!({ "message": format!("Fight #{} bet status updated to {}!", updated.match_number, updated.match_bet_status) })).into_response()
 }
@@ -639,6 +736,7 @@ pub async fn update_match_status(
         return AppError::internal(e).into_response();
     }
 
+    crate::services::realtime::tv_display(&state, body.match_id).await;
     if !body.dont_create {
         if let Ok(mut tx2) = state.db.begin().await {
             if new_static_match(&mut tx2, target.event_id).await.is_ok() {
@@ -646,6 +744,9 @@ pub async fn update_match_status(
             }
         }
     }
+    crate::services::realtime::latest_match_updated(&state, target.event_id).await;
+    crate::services::realtime::fight_history(&state, target.event_id).await;
+    crate::services::realtime::teller_balances(&state, target.event_id).await;
 
     Json(json!({ "message": format!("Fight #{match_number} match status updated to {}!", body.match_status) })).into_response()
 }
@@ -760,6 +861,8 @@ pub async fn update_display(
     if let Err(e) = tx.commit().await {
         return AppError::internal(e).into_response();
     }
+
+    crate::services::realtime::tv_display(&state, match_id).await;
 
     Json(json!({ "message": "TV display status updated successfully." })).into_response()
 }

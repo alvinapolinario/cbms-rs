@@ -5,6 +5,7 @@ mod error;
 mod extract;
 mod models;
 mod money;
+mod rows;
 mod routes;
 mod services;
 mod types;

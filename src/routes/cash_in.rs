@@ -6,7 +6,7 @@
 use crate::auth::{AuthedAdmin, AuthedTeller};
 use crate::extract::JsonOrForm;
 use crate::money::Money;
-use crate::services::{ledger, transactions::create_log};
+use crate::services::transactions::create_log;
 use crate::types::DbDateTime;
 use crate::AppState;
 use axum::extract::State;
@@ -17,17 +17,6 @@ use serde::Deserialize;
 use serde_json::json;
 use sqlx::Row;
 use std::sync::Arc;
-
-fn fail_422(message: String) -> Response {
-    (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({ "success": false, "message": message }))).into_response()
-}
-
-fn validate_amount(amount: f64, max: f64) -> Result<(), Response> {
-    if amount <= 0.0 || amount > max {
-        return Err(fail_422(format!("Enter an amount between 1 and {}.", max as i64)));
-    }
-    Ok(())
-}
 
 #[derive(Deserialize)]
 pub struct CashInTellerRequest {
@@ -40,10 +29,6 @@ pub async fn store_by_teller(
     teller: AuthedTeller,
     JsonOrForm(body): JsonOrForm<CashInTellerRequest>,
 ) -> Response {
-    if let Err(r) = validate_amount(body.amount.value(), state.config.cash_max) {
-        return r;
-    }
-
     let event_status: Option<String> = sqlx::query_scalar(
         "SELECT ev.event_status FROM events ev JOIN event_tellers et ON et.event_id = ev.event_id WHERE et.event_teller_id = ?",
     )
@@ -76,8 +61,8 @@ pub async fn store_by_teller(
 
     create_log(&state.db, teller.account_id, "Teller App", "Cash-in request by Teller.").await;
 
-    // TODO(realtime): broadcast TellerBalanceUpdated + CashInUpdated once the Pusher-trigger
-    // client exists (docs/WORKFLOW.md section 9).
+    crate::services::realtime::teller_balances(&state, teller.event_id).await;
+    crate::services::realtime::cash_ins(&state, teller.event_id).await;
 
     Json(json!({ "success": true, "message": "Cash-in request submitted successfully." })).into_response()
 }
@@ -95,10 +80,6 @@ pub async fn store_by_admin_via_app(
     admin: AuthedAdmin,
     JsonOrForm(body): JsonOrForm<CashInAdminRequest>,
 ) -> Response {
-    if let Err(r) = validate_amount(body.amount.value(), state.config.cash_max) {
-        return r;
-    }
-
     let mut tx = match state.db.begin().await {
         Ok(tx) => tx,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": format!("{e}") }))).into_response(),
@@ -135,33 +116,6 @@ pub async fn store_by_admin_via_app(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": format!("{e}") }))).into_response();
     }
 
-    if let Err(e) = sqlx::query("UPDATE cash_ins SET approved_at = NOW() WHERE cash_in_id = ? AND approved_at IS NULL")
-        .bind(cash_in_id)
-        .execute(&mut *tx)
-        .await
-    {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": format!("{e}") }))).into_response();
-    }
-    if let Err(e) = ledger::record(
-        &mut tx,
-        body.event_teller_id,
-        ledger::TYPE_CASH_IN,
-        body.amount,
-        Money::ZERO,
-        Some(admin.account_id),
-        ledger::LedgerMeta {
-            reference: Some(&format!("CI-{cash_in_id}")),
-            approved_by: Some(admin.admin_id),
-            source_table: Some("cash_ins"),
-            source_id: Some(cash_in_id),
-            ..Default::default()
-        },
-    )
-    .await
-    {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": format!("{e}") }))).into_response();
-    }
-
     create_log(&mut *tx, admin.account_id, "Admin App", "Cash-in by Admin.").await;
 
     if let Err(e) = tx.commit().await {
@@ -174,6 +128,11 @@ pub async fn store_by_admin_via_app(
         .await
         .ok()
         .flatten();
+
+    if let Some(event_id) = crate::services::realtime::event_id_of_teller(&state.db, body.event_teller_id).await {
+        crate::services::realtime::teller_balances(&state, event_id).await;
+        crate::services::realtime::cash_ins(&state, event_id).await;
+    }
 
     Json(json!({
         "success": true,
@@ -241,10 +200,6 @@ pub async fn approval_via_app(
     admin: AuthedAdmin,
     JsonOrForm(body): JsonOrForm<CashInApprovalRequest>,
 ) -> Response {
-    if body.cash_in_status != "Approved" && body.cash_in_status != "Declined" {
-        return fail_422("Status must be Approved or Declined.".to_string());
-    }
-
     let current_status: Option<String> = sqlx::query_scalar("SELECT cash_in_status FROM cash_ins WHERE cash_in_id = ?")
         .bind(body.cash_in_id)
         .fetch_optional(&state.db)
@@ -270,7 +225,7 @@ pub async fn approval_via_app(
         Ok(r) if r.rows_affected() == 1 => {}
         Ok(_) => {
             let _ = tx.rollback().await;
-            return Json(json!({ "success": false, "message": "This request was already processed." })).into_response();
+            return Json(json!({ "success": false, "message": "Invalid request" })).into_response();
         }
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": format!("{e}") }))).into_response(),
     }
@@ -293,67 +248,13 @@ pub async fn approval_via_app(
             Ok(v) => v,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": format!("{e}") }))).into_response(),
         };
-        if let Err(e) = sqlx::query("UPDATE event_tellers SET teller_balance = teller_balance + ? WHERE event_teller_id = ?")
+        if let Err(_) = sqlx::query("UPDATE event_tellers SET teller_balance = teller_balance + ? WHERE event_teller_id = ?")
             .bind(amount.to_db_string())
             .bind(event_teller_id)
             .execute(&mut *tx)
             .await
         {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": format!("{e}") }))).into_response();
-        }
-        if let Err(e) = sqlx::query("UPDATE cash_ins SET approved_at = NOW() WHERE cash_in_id = ? AND approved_at IS NULL")
-            .bind(body.cash_in_id)
-            .execute(&mut *tx)
-            .await
-        {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": format!("{e}") }))).into_response();
-        }
-        if let Err(e) = ledger::record(
-            &mut tx,
-            event_teller_id,
-            ledger::TYPE_CASH_IN,
-            amount,
-            Money::ZERO,
-            Some(admin.account_id),
-            ledger::LedgerMeta {
-                reference: Some(&format!("CI-{}", body.cash_in_id)),
-                approved_by: Some(admin.admin_id),
-                source_table: Some("cash_ins"),
-                source_id: Some(body.cash_in_id),
-                ..Default::default()
-            },
-        )
-        .await
-        {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": format!("{e}") }))).into_response();
-        }
-    } else {
-        if let Err(e) = sqlx::query("UPDATE cash_ins SET approved_at = NOW() WHERE cash_in_id = ? AND approved_at IS NULL")
-            .bind(body.cash_in_id)
-            .execute(&mut *tx)
-            .await
-        {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": format!("{e}") }))).into_response();
-        }
-        if let Err(e) = ledger::record(
-            &mut tx,
-            event_teller_id,
-            ledger::TYPE_CASH_DECLINED,
-            Money::ZERO,
-            Money::ZERO,
-            Some(admin.account_id),
-            ledger::LedgerMeta {
-                reference: Some(&format!("CI-{}", body.cash_in_id)),
-                approved_by: Some(admin.admin_id),
-                source_table: Some("cash_ins"),
-                source_id: Some(body.cash_in_id),
-                note: Some("Cash-in declined; no cash moved"),
-                ..Default::default()
-            },
-        )
-        .await
-        {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": format!("{e}") }))).into_response();
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": "Approval failed. Please try again." }))).into_response();
         }
     }
 
@@ -361,6 +262,11 @@ pub async fn approval_via_app(
 
     if let Err(e) = tx.commit().await {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": format!("{e}") }))).into_response();
+    }
+
+    if let Some(event_id) = crate::services::realtime::event_id_of_teller(&state.db, event_teller_id).await {
+        crate::services::realtime::teller_balances(&state, event_id).await;
+        crate::services::realtime::cash_ins(&state, event_id).await;
     }
 
     Json(json!({ "success": true, "message": "Cash-in has been approved successfully!" })).into_response()

@@ -22,9 +22,16 @@ pub struct Config {
     pub bet_min: f64,
     pub bet_max: f64,
     pub cash_max: f64,
+    /// Loaded for compatibility with older env files. Sabong2026 does not set
+    /// `expires_at` on API tokens, so this value is not applied.
+    #[allow(dead_code)]
     pub api_token_hours: i64,
     pub require_closed_before_result: bool,
+    /// Sabong2026 hardcodes 7 digits in `BetController@store` (`mt_rand` loop).
     pub receipt_random_digits: u32,
+    /// Shared secret for `GET /api/print-service/*`. Empty means those routes answer 503,
+    /// the same as Laravel's `PrintServiceKey` when `PRINT_SERVICE_KEY` is unset.
+    pub print_service_key: String,
 
     pub pusher_host: String,
     pub pusher_port: u16,
@@ -67,7 +74,8 @@ impl Config {
             cash_max: env_num("CASH_MAX", 1_000_000.0),
             api_token_hours: env_num("API_TOKEN_HOURS", 18),
             require_closed_before_result: env_bool("REQUIRE_CLOSED_BEFORE_RESULT", true),
-            receipt_random_digits: env_num("RECEIPT_RANDOM_DIGITS", 6),
+            receipt_random_digits: env_num("RECEIPT_RANDOM_DIGITS", 7),
+            print_service_key: env_or("PRINT_SERVICE_KEY", ""),
 
             pusher_host: env_or("PUSHER_HOST", "127.0.0.1"),
             pusher_port: env_num("PUSHER_PORT", 6001),
