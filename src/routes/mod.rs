@@ -9,6 +9,7 @@ pub mod event;
 pub mod event_teller;
 pub mod fight;
 pub mod print_api;
+pub mod reset;
 
 use crate::AppState;
 use axum::routing::{get, post};
@@ -99,6 +100,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/accounts/tellers/update", post(desk::teller_update))
         .route("/accounts/tellers/find/{teller_id}", post(desk::teller_find))
         .route("/accounts/tellers/{teller_id}/clear-phone-uid", post(desk::teller_clear_phone))
+        .route("/accounts/tellers/reset-account", post(desk::teller_reset_account))
         .route("/accounts/tellers/{teller_id}", axum::routing::delete(desk::teller_delete))
         .route("/cash-transactions/board", post(desk::cash_board))
         .route("/cash-transactions/cash-in", post(desk::cash_in_store))
@@ -112,6 +114,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/unclaimed/list/{event_id}", post(desk::unclaimed_list))
         .route("/reports/report/{event_id}", post(desk::report))
         .route("/logs/list", post(desk::logs))
+        .route("/operator/reset", post(reset::execute))
         .route("/salaries/list", post(desk::salary_list))
         .route("/salaries/store/{event_id}", post(desk::salary_store))
         .route("/salaries/update", post(desk::salary_update))

@@ -48,3 +48,24 @@ impl IntoResponse for AppError {
 }
 
 pub type AppResult<T> = Result<T, AppError>;
+
+/// Shown to clients when a database or internal failure happens. The real error is logged.
+pub const CLIENT_FAULT: &str = "Something went wrong! Please try again!";
+
+pub fn log_fault(err: &impl std::fmt::Display) -> &'static str {
+    tracing::error!(error = %err, "request failed");
+    CLIENT_FAULT
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_fault_hides_database_text() {
+        let shown = log_fault(&"Duplicate entry 'abc' for key 'PRIMARY'");
+        assert_eq!(shown, CLIENT_FAULT);
+        assert!(!shown.contains("Duplicate"));
+        assert!(!shown.contains("PRIMARY"));
+    }
+}

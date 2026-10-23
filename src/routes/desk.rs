@@ -346,6 +346,68 @@ pub async fn teller_update(
     scalar(1)
 }
 
+#[derive(Deserialize)]
+pub struct TellerReset {
+    pub teller_id: i32,
+    pub password: String,
+}
+
+/// Unlocks the teller's phone and replaces the login password. Nothing is written when the
+/// password is blank. The id is in the body because path-parameter routes on this service
+/// are swallowed by the static-file fallback.
+pub async fn teller_reset_account(
+    State(state): State<Arc<AppState>>,
+    actor: AuthedAdmin,
+    JsonOrForm(body): JsonOrForm<TellerReset>,
+) -> Response {
+    let teller_id = body.teller_id;
+    let password = body.password.trim();
+    if password.is_empty() {
+        return json_error(StatusCode::UNPROCESSABLE_ENTITY, "message", "Type a new password.");
+    }
+    let Ok(hash) = hash_password(password) else {
+        return scalar(0);
+    };
+    let account_id: Option<i32> = sqlx::query_scalar("SELECT account_id FROM tellers WHERE teller_id = ?")
+        .bind(teller_id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+    let Some(account_id) = account_id else {
+        return scalar(0);
+    };
+    let mut tx = match state.db.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return scalar(0),
+    };
+    if sqlx::query("UPDATE accounts SET password = ? WHERE account_id = ?")
+        .bind(&hash)
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await
+        .is_err()
+        || sqlx::query("UPDATE tellers SET phone_uid = '' WHERE teller_id = ?")
+            .bind(teller_id)
+            .execute(&mut *tx)
+            .await
+            .is_err()
+    {
+        return scalar(0);
+    }
+    create_log(
+        &mut *tx,
+        actor.account_id,
+        "Web App",
+        "Teller - Account reset. Phone unlocked and password changed.",
+    )
+    .await;
+    if tx.commit().await.is_err() {
+        return scalar(0);
+    }
+    scalar(1)
+}
+
 pub async fn teller_clear_phone(State(state): State<Arc<AppState>>, actor: AuthedAdmin, Path(teller_id): Path<i32>) -> Response {
     let updated = sqlx::query("UPDATE tellers SET phone_uid = '' WHERE teller_id = ?")
         .bind(teller_id)

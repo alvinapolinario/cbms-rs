@@ -93,7 +93,7 @@ pub async fn update_tellers_app(
         }
         Err(UpdateTellersError::Internal(e)) => {
             tracing::error!(error = %e, "update tellers failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("Failed to update tellers: {e}") }))).into_response()
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": crate::error::CLIENT_FAULT }))).into_response()
         }
     }
 }

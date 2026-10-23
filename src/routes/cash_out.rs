@@ -37,11 +37,11 @@ pub async fn store_by_teller(
     .ok()
     .flatten();
     let Some(row) = row else {
-        return Json(json!({ "success": false, "message": "Cash-in request failed, event is no longer Active." })).into_response();
+        return Json(json!({ "success": false, "message": "Cash-out request failed, event is no longer Active." })).into_response();
     };
     let event_status: String = row.get("event_status");
     if event_status != "Active" {
-        return Json(json!({ "success": false, "message": "Cash-in request failed, event is no longer Active." })).into_response();
+        return Json(json!({ "success": false, "message": "Cash-out request failed, event is no longer Active." })).into_response();
     }
     let teller_balance: Money = row.get("teller_balance");
     if body.amount.value() > teller_balance.value() {
@@ -61,7 +61,7 @@ pub async fn store_by_teller(
     if let Err(e) = result {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "success": false, "message": "Something went wrong! Please try again!", "error": format!("{e}") })),
+            Json(json!({ "success": false, "message": "Something went wrong! Please try again!", "error": crate::error::log_fault(&e) })),
         )
             .into_response();
     }
@@ -101,7 +101,7 @@ pub async fn store_by_admin_via_app(
 
     let mut tx = match state.db.begin().await {
         Ok(tx) => tx,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": format!("{e}") }))).into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": crate::error::log_fault(&e) }))).into_response(),
     };
 
     let now = DbDateTime::now();
@@ -120,7 +120,7 @@ pub async fn store_by_admin_via_app(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "success": false, "message": "Something went wrong! Please try again!", "error": format!("{e}") })),
+                Json(json!({ "success": false, "message": "Something went wrong! Please try again!", "error": crate::error::log_fault(&e) })),
             )
                 .into_response()
         }
@@ -139,13 +139,13 @@ pub async fn store_by_admin_via_app(
             let _ = tx.rollback().await;
             return Json(json!({ "success": false, "message": "Not enough cash on hand." })).into_response();
         }
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": format!("{e}") }))).into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": crate::error::log_fault(&e) }))).into_response(),
     }
 
     create_log(&mut *tx, admin.account_id, "Admin App", "Cash-out by Admin.").await;
 
     if let Err(e) = tx.commit().await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": format!("{e}") }))).into_response();
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": crate::error::log_fault(&e) }))).into_response();
     }
 
     let cash_out_row = sqlx::query("SELECT * FROM cash_outs_view WHERE cash_out_id = ?")
@@ -236,7 +236,7 @@ pub async fn approval_via_app(
 
     let mut tx = match state.db.begin().await {
         Ok(tx) => tx,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": format!("{e}") }))).into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": crate::error::log_fault(&e) }))).into_response(),
     };
 
     let won = sqlx::query("UPDATE cash_outs SET cash_out_status = ?, admin_id = ? WHERE cash_out_id = ? AND cash_out_status = 'Pending'")
@@ -251,7 +251,7 @@ pub async fn approval_via_app(
             let _ = tx.rollback().await;
             return Json(json!({ "success": false, "message": "The request is invalid." })).into_response();
         }
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": format!("{e}") }))).into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": crate::error::log_fault(&e) }))).into_response(),
     }
 
     let (event_teller_id, amount): (i32, Money) =
@@ -261,7 +261,7 @@ pub async fn approval_via_app(
             .await
         {
             Ok(v) => v,
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": format!("{e}") }))).into_response(),
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": crate::error::log_fault(&e) }))).into_response(),
         };
 
     if body.cash_out_status == "Approved" {
@@ -278,7 +278,7 @@ pub async fn approval_via_app(
     create_log(&mut *tx, admin.account_id, "Admin App", "Cash-out approval by Admin.").await;
 
     if let Err(e) = tx.commit().await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": format!("{e}") }))).into_response();
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": crate::error::log_fault(&e) }))).into_response();
     }
 
     let cash_out_row = sqlx::query("SELECT * FROM cash_outs_view WHERE cash_out_id = ?")

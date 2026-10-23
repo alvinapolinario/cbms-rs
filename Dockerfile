@@ -16,7 +16,11 @@ RUN touch src/main.rs && cargo build --release
 # ---- Runtime stage ----------------------------------------------------------------------------
 FROM debian:bookworm-slim
 
-RUN apt-get update \
+# deb.debian.org is unreachable from the deploy host. Rise mirrors bookworm main;
+# its security suite 404s and bookworm-updates is past Valid-Until, which fails apt.
+RUN rm -f /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources \
+    && printf 'Types: deb\nURIs: http://mirror.rise.ph/debian\nSuites: bookworm\nComponents: main\n' > /etc/apt/sources.list.d/debian.sources \
+    && apt-get -o Acquire::Check-Valid-Until=false update \
     && apt-get install -y --no-install-recommends \
        nginx supervisor ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/* \

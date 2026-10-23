@@ -29,23 +29,38 @@ impl FromRequestParts<Arc<AppState>> for PrintAuth {
     type Rejection = Response;
 
     async fn from_request_parts(parts: &mut Parts, state: &Arc<AppState>) -> Result<Self, Self::Rejection> {
-        let expected = state.config.print_service_key.as_str();
-        if expected.is_empty() {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({ "message": "Print service key not configured" })),
-            )
-                .into_response());
-        }
         let provided = parts
             .headers
             .get("x-print-key")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        if !keys_equal(expected, provided) {
-            return Err((StatusCode::UNAUTHORIZED, Json(json!({ "message": "Unauthorized" }))).into_response());
+        match print_access(state.config.print_service_key.as_str(), provided) {
+            PrintAccess::Ready => Ok(PrintAuth),
+            PrintAccess::NotConfigured => Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "message": "Print service key not configured" })),
+            )
+                .into_response()),
+            PrintAccess::Denied => {
+                Err((StatusCode::UNAUTHORIZED, Json(json!({ "message": "Unauthorized" }))).into_response())
+            }
         }
-        Ok(PrintAuth)
+    }
+}
+
+enum PrintAccess {
+    Ready,
+    NotConfigured,
+    Denied,
+}
+
+fn print_access(expected: &str, provided: &str) -> PrintAccess {
+    if expected.is_empty() {
+        PrintAccess::NotConfigured
+    } else if keys_equal(expected, provided) {
+        PrintAccess::Ready
+    } else {
+        PrintAccess::Denied
     }
 }
 
@@ -485,4 +500,22 @@ fn server_error(err: sqlx::Error) -> Response {
         Json(json!({ "message": "Unexpected server error." })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_print_key_is_not_configured() {
+        assert!(matches!(print_access("", ""), PrintAccess::NotConfigured));
+        assert!(matches!(print_access("", "wrong-key"), PrintAccess::NotConfigured));
+    }
+
+    #[test]
+    fn wrong_print_key_is_denied_once_configured() {
+        assert!(matches!(print_access("secret", ""), PrintAccess::Denied));
+        assert!(matches!(print_access("secret", "wrong-key"), PrintAccess::Denied));
+        assert!(matches!(print_access("secret", "secret"), PrintAccess::Ready));
+    }
 }

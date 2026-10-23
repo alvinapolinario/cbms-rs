@@ -43,7 +43,7 @@ pub async fn create_bet(
 
     let mut tx = match state.db.begin().await {
         Ok(tx) => tx,
-        Err(e) => return soft_fail(&format!("{e}")),
+        Err(e) => return soft_fail(crate::error::log_fault(&e)),
     };
 
     let event_row = sqlx::query("SELECT event_id, event_name FROM events WHERE event_status = 'Active' LIMIT 1")
@@ -159,7 +159,7 @@ pub async fn create_bet(
     .await;
     let bet_id = match insert {
         Ok(r) => r.last_insert_id() as i32,
-        Err(e) => return soft_fail(&format!("Bet was not saved. Please try again. ({e})")),
+        Err(e) => return soft_fail(crate::error::log_fault(&e)),
     };
 
     create_log(&mut *tx, tel_account_id, "Teller App", &format!("Bet Created. receipt={receipt_code}")).await;
@@ -181,7 +181,7 @@ pub async fn create_bet(
     .execute(&mut *tx)
     .await
     {
-        return soft_fail(&format!("{e}"));
+        return soft_fail(crate::error::log_fault(&e));
     }
 
     if let Err(e) = sqlx::query(
@@ -193,7 +193,7 @@ pub async fn create_bet(
     .execute(&mut *tx)
     .await
     {
-        return soft_fail(&format!("{e}"));
+        return soft_fail(crate::error::log_fault(&e));
     }
 
     if let Err(e) = ledger::record(
@@ -215,11 +215,11 @@ pub async fn create_bet(
     )
     .await
     {
-        return soft_fail(&format!("{e}"));
+        return soft_fail(crate::error::log_fault(&e));
     }
 
     if let Err(e) = tx.commit().await {
-        return soft_fail(&format!("{e}"));
+        return soft_fail(crate::error::log_fault(&e));
     }
 
     let bet = match sqlx::query_as::<_, Bet>("SELECT * FROM bets WHERE bet_id = ?")
@@ -228,7 +228,7 @@ pub async fn create_bet(
         .await
     {
         Ok(b) => b,
-        Err(e) => return soft_fail(&format!("{e}")),
+        Err(e) => return soft_fail(crate::error::log_fault(&e)),
     };
 
     crate::services::realtime::match_updated(&state, fight_match_id).await;
@@ -265,7 +265,7 @@ pub async fn void_bet(
 
     let mut tx = match state.db.begin().await {
         Ok(tx) => tx,
-        Err(e) => return soft_fail(&format!("{e}")),
+        Err(e) => return soft_fail(crate::error::log_fault(&e)),
     };
 
     let bet_row = sqlx::query("SELECT * FROM bets WHERE bet_receipt_code = ? FOR UPDATE")
@@ -329,7 +329,7 @@ pub async fn void_bet(
     .execute(&mut *tx)
     .await
     {
-        return soft_fail(&format!("{e}"));
+        return soft_fail(crate::error::log_fault(&e));
     }
 
     if let Err(e) = sqlx::query(
@@ -341,7 +341,7 @@ pub async fn void_bet(
     .execute(&mut *tx)
     .await
     {
-        return soft_fail(&format!("{e}"));
+        return soft_fail(crate::error::log_fault(&e));
     }
 
     if let Err(e) = ledger::record(
@@ -363,7 +363,7 @@ pub async fn void_bet(
     )
     .await
     {
-        return soft_fail(&format!("{e}"));
+        return soft_fail(crate::error::log_fault(&e));
     }
 
     let (new_meron_total, new_wala_total) = match bet_side.as_str() {
@@ -393,13 +393,13 @@ pub async fn void_bet(
     .execute(&mut *tx)
     .await
     {
-        return soft_fail(&format!("{e}"));
+        return soft_fail(crate::error::log_fault(&e));
     }
 
     create_log(&mut *tx, teller.account_id, "Teller App", &format!("Bet voided. receipt={receipt_code}")).await;
 
     if let Err(e) = tx.commit().await {
-        return soft_fail(&format!("{e}"));
+        return soft_fail(crate::error::log_fault(&e));
     }
 
     crate::services::realtime::teller_balances(&state, teller.event_id).await;
@@ -598,7 +598,7 @@ pub async fn voided_bets(State(state): State<Arc<AppState>>, teller: AuthedTelle
         .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "success": false, "message": "Failed to retrieve payout history.", "error": format!("{e}") })),
+            Json(json!({ "success": false, "message": crate::error::log_fault(&e) })),
         )
             .into_response(),
     }

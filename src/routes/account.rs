@@ -146,7 +146,7 @@ async fn teller_login_response(state: &Arc<AppState>, row: sqlx::mysql::MySqlRow
 
     let token = match mint_token(db, "EventTeller", event_teller_id, "teller-token").await {
         Ok(t) => t,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "message": format!("{e}") }))).into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "message": crate::error::log_fault(&e) }))).into_response(),
     };
 
     let latest_match = sqlx::query("SELECT match_id, match_number, match_bet_status FROM matches WHERE event_id = ? ORDER BY match_number DESC LIMIT 1")
@@ -194,10 +194,9 @@ pub struct LoginAppAdminRequest {
     pub password: String,
 }
 
-/// `POST /login-app-admin` -- mirrors `AccountController@loginAppAdmin`. Notably: `admin` in the
-/// response is the **entire `admins_view` row**, which includes the bcrypt password hash -- that
-/// is what the real app returns, verified against the live `admins_view` definition, not
-/// assumed. `cash_in`/`cash_out` are `SUM(...)` over approved cash movements for the Active
+/// `POST /login-app-admin` -- mirrors `AccountController@loginAppAdmin`. The `admin` object
+/// follows `admins_view` except the password hash, which is left out of the JSON.
+/// `cash_in`/`cash_out` are `SUM(...)` over approved cash movements for the Active
 /// event; Laravel's query builder `sum()` falls back to the **integer** `0` (not the string
 /// `"0.00"`) when there are no matching rows (`$this->aggregate(...) ?: 0`), so those two fields
 /// genuinely change JSON type depending on whether any approved cash movement exists yet -- that
@@ -245,7 +244,7 @@ pub async fn login_app_admin(
 
     let token = match mint_token(db, "EventAdmin", admin_id, "admin-token").await {
         Ok(t) => t,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "message": format!("{e}") }))).into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "message": crate::error::log_fault(&e) }))).into_response(),
     };
 
     let latest_match = sqlx::query("SELECT match_id, match_number, match_bet_status FROM matches WHERE event_id = ? ORDER BY match_number DESC LIMIT 1")
@@ -301,7 +300,6 @@ fn admin_row_to_json(row: &sqlx::mysql::MySqlRow) -> Value {
         "account_id": row.get::<i32, _>("account_id"),
         "admin_name": row.get::<String, _>("admin_name"),
         "username": row.get::<String, _>("username"),
-        "password": row.get::<String, _>("password"),
         "account_type": row.get::<String, _>("account_type"),
         "is_active": row.get::<i8, _>("is_active"),
         "account_date_created": row.get::<crate::types::DbDateTime, _>("account_date_created"),
@@ -431,7 +429,7 @@ pub async fn login_qr(State(state): State<Arc<AppState>>, JsonOrForm(body): Json
     // QR at once cannot both be linked.
     let mut tx = match db.begin().await {
         Ok(tx) => tx,
-        Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e}")),
+        Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, &crate::error::log_fault(&e)),
     };
     let locked = match sqlx::query("SELECT phone_uid FROM tellers WHERE teller_id = ? FOR UPDATE")
         .bind(teller_id)
@@ -439,7 +437,7 @@ pub async fn login_qr(State(state): State<Arc<AppState>>, JsonOrForm(body): Json
         .await
     {
         Ok(r) => r,
-        Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e}")),
+        Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, &crate::error::log_fault(&e)),
     };
     let existing_phone_uid: String = locked.get("phone_uid");
 
@@ -470,13 +468,13 @@ pub async fn login_qr(State(state): State<Arc<AppState>>, JsonOrForm(body): Json
             .await
         {
             let _ = tx.rollback().await;
-            return fail(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e}"));
+            return fail(StatusCode::INTERNAL_SERVER_ERROR, &crate::error::log_fault(&e));
         }
         create_log(&mut *tx, account_id, "Teller App", &format!("Device activated by QR for Teller {teller_name}, device UID: {}", body.phone_uid)).await;
     }
 
     if let Err(e) = tx.commit().await {
-        return fail(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e}"));
+        return fail(StatusCode::INTERNAL_SERVER_ERROR, &crate::error::log_fault(&e));
     }
 
     create_log(db, account_id, "Teller App", &format!("QR Login by Teller {teller_name} using device UID: {}", body.phone_uid)).await;
@@ -487,7 +485,7 @@ pub async fn login_qr(State(state): State<Arc<AppState>>, JsonOrForm(body): Json
         .await;
     match fresh_row {
         Ok(row) => teller_login_response(&state, row).await,
-        Err(e) => fail(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e}")),
+        Err(e) => fail(StatusCode::INTERNAL_SERVER_ERROR, &crate::error::log_fault(&e)),
     }
 }
 
@@ -511,7 +509,7 @@ pub async fn change_password(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "success": false, "message": "An error occurred while changing the password.", "error": format!("{e}") })),
+                Json(json!({ "success": false, "message": "An error occurred while changing the password.", "error": crate::error::log_fault(&e) })),
             )
                 .into_response()
         }
@@ -519,7 +517,7 @@ pub async fn change_password(
 
     let mut tx = match state.db.begin().await {
         Ok(tx) => tx,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": format!("{e}") }))).into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": crate::error::log_fault(&e) }))).into_response(),
     };
 
     let teller_name: Option<String> = sqlx::query_scalar("SELECT teller_name FROM tellers WHERE teller_id = ?")
@@ -537,7 +535,7 @@ pub async fn change_password(
     {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "success": false, "message": "An error occurred while changing the password.", "error": format!("{e}") })),
+            Json(json!({ "success": false, "message": "An error occurred while changing the password.", "error": crate::error::log_fault(&e) })),
         )
             .into_response();
     }
@@ -549,7 +547,7 @@ pub async fn change_password(
     {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "success": false, "message": "An error occurred while changing the password.", "error": format!("{e}") })),
+            Json(json!({ "success": false, "message": "An error occurred while changing the password.", "error": crate::error::log_fault(&e) })),
         )
             .into_response();
     }
@@ -568,7 +566,7 @@ pub async fn change_password(
     .await;
 
     if let Err(e) = tx.commit().await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": format!("{e}") }))).into_response();
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": crate::error::log_fault(&e) }))).into_response();
     }
 
     Json(json!({ "success": true, "message": "Password changed successfully!" })).into_response()
@@ -604,7 +602,7 @@ pub async fn register_desktop_uid(
     {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "success": false, "message": "An error occurred.", "error": format!("{e}") })),
+            Json(json!({ "success": false, "message": "An error occurred.", "error": crate::error::log_fault(&e) })),
         )
             .into_response();
     }

@@ -60,7 +60,6 @@ pub async fn get_data(State(state): State<Arc<AppState>>, admin: AuthedAdmin) ->
             "account_id": row.get::<i32, _>("account_id"),
             "admin_name": row.get::<String, _>("admin_name"),
             "username": row.get::<String, _>("username"),
-            "password": row.get::<String, _>("password"),
             "account_type": row.get::<String, _>("account_type"),
             "is_active": row.get::<i8, _>("is_active"),
             "account_date_created": row.get::<crate::types::DbDateTime, _>("account_date_created"),

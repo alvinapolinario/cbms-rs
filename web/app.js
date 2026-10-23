@@ -10,7 +10,7 @@ const NAV = [
   ["Cash Transactions", "cash-transactions"],
   ["Teller Transactions", "teller-transactions"],
   ["Bets", "bets"],
-  ["Unclaimed", "unclaimed"],
+  ["Unclaimed", "unclaim"],
   ["Remittances", "remittances"],
   ["Salaries", "salaries"],
   ["Reports", "reports"],
@@ -44,10 +44,10 @@ function esc(value) {
   }[ch]));
 }
 
-function peso(value) {
+function peso(value, digits = 2) {
   const n = Number(value);
   if (!Number.isFinite(n)) return value == null || value === "" ? "—" : String(value);
-  return n.toLocaleString("en-PH", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return n.toLocaleString("en-PH", { minimumFractionDigits: digits, maximumFractionDigits: digits });
 }
 
 function odds(value) {
@@ -76,6 +76,55 @@ function toast(message, kind) {
 function stopPoll() {
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = null;
+}
+
+let closeLive = null;
+function stopLive() {
+  if (closeLive) closeLive();
+  closeLive = null;
+}
+
+// Same Pusher channels the Laravel screens listen to. A message means the row is already saved,
+// so the page reloads that one board instead of waiting for the next timer.
+function startLive(refresh) {
+  stopLive();
+  const url = `ws://${location.hostname}:6001/app/local?protocol=7&client=js&version=7.0.0&flash=false`;
+  let socket = null;
+  let stopped = false;
+  let retry = null;
+  let batch = null;
+  const channels = ["match-updates", "fight-history", "tv-display"];
+  function connect() {
+    if (stopped) return;
+    socket = new WebSocket(url);
+    socket.onmessage = (message) => {
+      let frame;
+      try { frame = JSON.parse(message.data); } catch { return; }
+      if (frame.event === "pusher:ping") {
+        socket.send(JSON.stringify({ event: "pusher:pong", data: {} }));
+        return;
+      }
+      if (frame.event === "pusher:connection_established") {
+        channels.forEach((channel) => {
+          socket.send(JSON.stringify({ event: "pusher:subscribe", data: { channel } }));
+        });
+        return;
+      }
+      if (!frame.event || String(frame.event).startsWith("pusher:")) return;
+      clearTimeout(batch);
+      batch = setTimeout(() => { refresh().catch(() => {}); }, 30);
+    };
+    socket.onclose = () => {
+      if (!stopped) retry = setTimeout(connect, 1500);
+    };
+  }
+  connect();
+  closeLive = () => {
+    stopped = true;
+    clearTimeout(retry);
+    clearTimeout(batch);
+    if (socket) socket.close();
+  };
 }
 
 function startPoll(fn, ms) {
@@ -199,6 +248,7 @@ function shell(title) {
 
 function mount(title, render) {
   stopPoll();
+  stopLive();
   document.body.classList.remove("nav-open");
   document.getElementById("modal").close();
   document.getElementById("app").innerHTML = shell(title);
@@ -216,6 +266,7 @@ function mount(title, render) {
 
 function loginPage() {
   stopPoll();
+  stopLive();
   document.body.classList.remove("nav-open");
   const remembered = localStorage.getItem("sabong.username") || "";
   document.getElementById("app").innerHTML = `
@@ -330,15 +381,33 @@ function accountPages(kind) {
           { label: "Contact", key: "contact_number" },
           { label: "Phone", html: (row) => esc(row.phone_uid || "—") },
           { label: "Active", html: (row) => badge(Number(row.is_active) === 1 ? "Active" : "Inactive") },
-          { label: "", html: (row) => `<button class="btn ghost" data-edit="${row.teller_id}">Edit</button> <button class="btn ghost" data-clear="${row.teller_id}">Clear phone</button> <button class="btn danger" data-del="${row.teller_id}">Delete</button>` },
+          { label: "", html: (row) => `<button class="btn ghost" data-edit="${row.teller_id}">Edit</button> <button class="btn ghost" data-reset="${row.teller_id}">Reset account</button> <button class="btn ghost" data-clear="${row.teller_id}">Clear phone</button> <button class="btn danger" data-del="${row.teller_id}">Delete</button>` },
         ];
       document.getElementById("list").innerHTML = `<div class="card">${table(columns, list)}</div>`;
       document.getElementById("list").onclick = async (event) => {
         const edit = event.target.closest("[data-edit]");
         const del = event.target.closest("[data-del]");
         const clear = event.target.closest("[data-clear]");
+        const reset = event.target.closest("[data-reset]");
         try {
           if (edit) await editAccount(isAdmin, list.find((row) => String(isAdmin ? row.admin_id : row.teller_id) === edit.dataset.edit), load);
+          if (reset) {
+            const teller = list.find((row) => String(row.teller_id) === reset.dataset.reset);
+            openModal(
+              "Reset account",
+              `<p>Unlocks the phone linked to ${esc(teller?.teller_name || "this teller")} and sets a new login password.</p>
+               ${field("New password", "password", "", "password", "required autocomplete=\"new-password\"")}`,
+              async (form) => {
+                const data = formData(form);
+                if (!String(data.password || "").trim()) throw new Error("Type a new password.");
+                const result = await api("/accounts/tellers/reset-account", { body: { teller_id: Number(reset.dataset.reset), password: data.password } });
+                if (!scalarOk(result)) throw new Error("Could not reset the account.");
+                toast("Account reset. The phone is unlocked.");
+                await load();
+              },
+              "Reset",
+            );
+          }
           if (clear && confirm("Clear this teller's phone lock?")) {
             const result = await api(`/accounts/tellers/${clear.dataset.clear}/clear-phone-uid`);
             if (!scalarOk(result)) throw new Error("Could not clear the phone.");
@@ -617,6 +686,7 @@ async function pageMatches(view) {
     view.querySelector("#wala-wins").disabled = betsOpen;
     view.querySelector("#cancel-fight").disabled = betsOpen;
     view.querySelector("#draw-fight").disabled = betsOpen;
+    if (pendingBet) paintBet(pendingBet);
     const nextSig = (data.matches || []).map((fight) => [fight.match_id, fight.match_status, fight.match_winner, fight.meron_odds, fight.wala_odds, fight.is_display].join(":")).join("|");
     if (nextSig !== signature) {
       signature = nextSig;
@@ -641,7 +711,21 @@ async function pageMatches(view) {
   }
 
   const pendingLock = { meron: null, wala: null };
+  let pendingBet = null;
   let boardEpoch = 0;
+
+  function paintBet(status) {
+    const open = status === "Open";
+    view.querySelector("#bet-status").innerHTML = badge(status);
+    view.querySelector("#close-bet").disabled = !open;
+    view.querySelector("#open-bet").disabled = open;
+    view.querySelector("#toggle-meron").disabled = !open;
+    view.querySelector("#toggle-wala").disabled = !open;
+    view.querySelector("#meron-wins").disabled = open;
+    view.querySelector("#wala-wins").disabled = open;
+    view.querySelector("#cancel-fight").disabled = open;
+    view.querySelector("#draw-fight").disabled = open;
+  }
 
   function paintSide(side, locked) {
     if (side === "meron") {
@@ -698,6 +782,7 @@ async function pageMatches(view) {
       button.hidden = true;
       view.querySelector("#board").hidden = false;
       startPoll(() => { refresh().catch(() => {}); }, 2000);
+      startLive(() => refresh());
       await refresh();
     } catch (err) {
       toast(err.message || "Failed to get started.", "err");
@@ -706,14 +791,30 @@ async function pageMatches(view) {
   };
   view.querySelector("#toggle-meron").onclick = () => toggleSide("meron", "/matches-admin/toggle-meron");
   view.querySelector("#toggle-wala").onclick = () => toggleSide("wala", "/matches-admin/toggle-wala");
-  view.querySelector("#open-bet").onclick = () => {
-    if (!current || !confirm("You are about to open the bet for this match.")) return;
-    act(async () => api("/matches-admin/update-bet-status", { body: { match_id: current.match_id, match_bet_status: "Open", ...(await entries()) } }));
-  };
-  view.querySelector("#close-bet").onclick = () => {
-    if (!current || !confirm("You are about to close the bet for this match.")) return;
-    act(async () => api("/matches-admin/update-bet-status", { body: { match_id: current.match_id, match_bet_status: "Closed", ...(await entries()) } }));
-  };
+  function setBetStatus(status, prompt) {
+    if (!current || pendingBet) return;
+    if (!confirm(prompt)) return;
+    const matchId = current.match_id;
+    const previous = current.match_bet_status;
+    pendingBet = status;
+    boardEpoch += 1;
+    paintBet(status);
+    entries().then((fields) => api("/matches-admin/update-bet-status", {
+      body: { match_id: matchId, match_bet_status: status, ...fields },
+    })).then(() => {
+      pendingBet = null;
+      if (current && current.match_id === matchId) current.match_bet_status = status;
+      refresh().catch(() => {});
+    }).catch((err) => {
+      pendingBet = null;
+      boardEpoch += 1;
+      if (current && current.match_id === matchId) current.match_bet_status = previous;
+      paintBet(previous);
+      toast(err.message, "err");
+    });
+  }
+  view.querySelector("#open-bet").onclick = () => setBetStatus("Open", "You are about to open the bet for this match.");
+  view.querySelector("#close-bet").onclick = () => setBetStatus("Closed", "You are about to close the bet for this match.");
   async function settle(status, winner, message) {
     if (!current || !confirm(message)) return;
     await act(() => api("/matches-admin/update-match-status", { body: { match_id: current.match_id, match_status: status, winner } }));
@@ -787,6 +888,17 @@ function balls(matches) {
   return `<div class="balls">${columns.map((column) => `<div class="col">${column.items.join("")}</div>`).join("")}</div>`;
 }
 
+function stickBallsToRight(board) {
+  const strip = board.querySelector(".balls");
+  if (!strip) return;
+  const follow = board.dataset.ballsFollow !== "0";
+  if (follow) strip.scrollLeft = strip.scrollWidth;
+  strip.onscroll = () => {
+    const atRight = strip.scrollLeft + strip.clientWidth >= strip.scrollWidth - 4;
+    board.dataset.ballsFollow = atRight ? "1" : "0";
+  };
+}
+
 function tvMarkup(match) {
   const closed = match?.match_bet_status === "Closed";
   const meronLocked = Number(match?.meron_bet_status) === 1;
@@ -800,14 +912,14 @@ function tvMarkup(match) {
       <div class="tv-side ${meronLocked ? "" : "bg-meron"}" id="tv-meron" style="${meronLocked ? "background:#9a8f8f" : ""}">
         <h3>MERON</h3>
         <div class="entry">${esc(match?.meron_entry || "")}</div>
-        <div class="amt">${peso(match?.meron_total_bet || 0)}</div>
+        <div class="amt">${peso(match?.meron_total_bet || 0, 0)}</div>
         <div class="odds">${odds(match?.meron_odds)}</div>
         <div class="lock">${meronLocked ? "DISABLED" : ""}</div>
       </div>
       <div class="tv-side ${walaLocked ? "" : "bg-wala"}" style="${walaLocked ? "background:#9a8f8f" : ""}">
         <h3>WALA</h3>
         <div class="entry">${esc(match?.wala_entry || "")}</div>
-        <div class="amt">${peso(match?.wala_total_bet || 0)}</div>
+        <div class="amt">${peso(match?.wala_total_bet || 0, 0)}</div>
         <div class="odds">${odds(match?.wala_odds)}</div>
         <div class="lock">${walaLocked ? "DISABLED" : ""}</div>
       </div>
@@ -840,6 +952,8 @@ function resultOverlay(matches) {
 }
 
 async function pageTv(_view, variant) {
+  stopPoll();
+  stopLive();
   const savedOverlay = localStorage.getItem("sabong.overlay") || "";
   const frame = variant !== "new" ? "" : savedOverlay
     ? `<iframe class="overlay-frame" src="${esc(savedOverlay)}" title="Overlay"></iframe>`
@@ -860,8 +974,10 @@ async function pageTv(_view, variant) {
     try { data = await api("/tv/board", { method: "GET", auth: false }); }
     catch (err) { board.innerHTML = `<p>${esc(err.message)}</p>`; return; }
     board.innerHTML = tvMarkup(data.match) + `<h3 style="color:#fff;font-weight:500">Fight history</h3>` + balls(data.matches) + resultOverlay(data.matches);
+    stickBallsToRight(board);
   }
   await refresh();
+  startLive(() => refresh());
   startPoll(() => { refresh().catch(() => {}); }, 1500);
 }
 
@@ -1018,6 +1134,71 @@ async function pageBets(view, unclaimed) {
     draw();
   }
   select.onchange = () => load().catch((err) => toast(err.message, "err"));
+  view.querySelector("#q").oninput = draw;
+  await load();
+}
+
+function claimResult(row) {
+  if (row.match_status === "Draw") return "Draw refund";
+  if (row.match_status === "Cancelled") return "Cancelled refund";
+  if (Number(row.bet_is_winner) === 1) {
+    const value = row.bet_side === "Wala" ? row.wala_odds : row.meron_odds;
+    return `Winner ${odds(value)}`;
+  }
+  return row.match_status || "";
+}
+
+function betTime(value) {
+  if (!value) return "";
+  const date = new Date(String(value).replace(" ", "T"));
+  if (Number.isNaN(date.getTime())) return String(value);
+  return date.toLocaleString("en-US", { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" });
+}
+
+async function pageUnclaimed(view) {
+  view.innerHTML = `
+    <div class="row">
+      <label class="field grow">Event<select id="event"></select></label>
+      <label class="field">Fight<select id="fight"><option value="">All fights</option></select></label>
+      <label class="field grow">Search<input id="q" placeholder="Receipt, teller, side"></label>
+    </div>
+    <div id="stats"></div>
+    <div id="list"></div>`;
+  const select = view.querySelector("#event");
+  const fightSelect = view.querySelector("#fight");
+  try { await eventOptions(select, true); } catch (err) { toast(err.message, "err"); return; }
+  let rows = [];
+  function draw() {
+    const q = view.querySelector("#q").value.trim().toLowerCase();
+    const fight = fightSelect.value;
+    const shown = rows.filter((row) => {
+      if (fight && String(row.match_number) !== fight) return false;
+      return !q || JSON.stringify(row).toLowerCase().includes(q);
+    });
+    view.querySelector("#list").innerHTML = `<div class="card">${table([
+      { label: "Receipt", key: "bet_receipt_code" },
+      { label: "Fight", html: (row) => esc(row.match_number ?? "") },
+      { label: "Side", html: (row) => row.bet_side === "Meron" ? '<span class="meron-text">Meron</span>' : `<span class="wala-text">${esc(row.bet_side || "")}</span>` },
+      { label: "Stake", html: (row) => peso(row.bet_amount) },
+      { label: "Result", html: (row) => esc(claimResult(row)) },
+      { label: "Bet time", html: (row) => esc(betTime(row.bet_datetime)) },
+      { label: "Teller", key: "teller_name" },
+      { label: "Payout", html: (row) => peso(row.bet_payout_amount) },
+    ], shown)}</div>`;
+  }
+  async function load() {
+    const id = Number(select.value);
+    const data = await api(`/unclaimed/list/${id}`);
+    rows = (data.bets || []).slice().sort((a, b) => Number(a.match_number) - Number(b.match_number) || String(a.bet_datetime).localeCompare(String(b.bet_datetime)));
+    const fights = [...new Set(rows.map((row) => row.match_number))].sort((a, b) => Number(a) - Number(b));
+    const chosen = fightSelect.value;
+    fightSelect.innerHTML = `<option value="">All fights</option>` + fights.map((fight) => `<option value="${esc(fight)}">Fight ${esc(fight)}</option>`).join("");
+    if (fights.some((fight) => String(fight) === chosen)) fightSelect.value = chosen;
+    view.querySelector("#stats").innerHTML = `<div class="card">Unclaimed amount <strong>${peso(data.unclaimed)}</strong> · ${rows.length} receipt${rows.length === 1 ? "" : "s"}</div>`;
+    draw();
+  }
+  select.onchange = () => load().catch((err) => toast(err.message, "err"));
+  fightSelect.onchange = draw;
   view.querySelector("#q").oninput = draw;
   await load();
 }
@@ -1287,6 +1468,35 @@ async function pageLogs(view) {
   } catch (err) { toast(err.message, "err"); }
 }
 
+function pageReset(view) {
+  view.innerHTML = `
+    <div class="card">
+      <h3>Reset</h3>
+      <p>This clears bets, cash, claims, fights, and logs. It also unlocks every teller phone and removes tellers from events. Teller and admin logins stay. A backup is saved before anything is deleted.</p>
+      <label class="field">Type RESET to confirm<input id="confirm" autocomplete="off"></label>
+      <button class="btn danger" id="go" type="button">Reset</button>
+    </div>`;
+  view.querySelector("#go").onclick = async () => {
+    const confirmation = view.querySelector("#confirm").value.trim();
+    if (confirmation !== "RESET") {
+      toast("Type RESET to confirm.", "err");
+      return;
+    }
+    if (!confirm("Reset fights, bets, and teller phone locks?")) return;
+    const button = view.querySelector("#go");
+    button.disabled = true;
+    try {
+      const result = await api("/operator/reset", { body: { confirmation } });
+      toast(result.message || "Reset complete.");
+      writeSession(null);
+      location.hash = "#/login";
+    } catch (err) {
+      toast(err.message, "err");
+      button.disabled = false;
+    }
+  };
+}
+
 function pageNotice(view, title, body) {
   view.innerHTML = `<div class="card"><h2>${esc(title)}</h2><p>${body}</p></div>`;
 }
@@ -1300,17 +1510,22 @@ const PAGES = {
   "cash-transactions": ["Cash Transactions", pageCash],
   "teller-transactions": ["Teller Transactions", pageTellerTx],
   bets: ["Bets", (view) => pageBets(view, false)],
-  unclaimed: ["Unclaimed", (view) => pageBets(view, true)],
+  unclaim: ["Unclaimed", pageUnclaimed],
+  unclaimed: ["Unclaimed", pageUnclaimed],
   remittances: ["Remittances", pageRemittances],
   salaries: ["Salaries", pageSalaries],
   reports: ["Reports", pageReports],
   logs: ["Logs", pageLogs],
-  reset: ["Reset", (view) => pageNotice(view, "Reset", "Database reset stays on the Laravel operator page. It dumps the database, then clears bets, cash, fights, and phone locks after the operator types RESET.")],
+  reset: ["Reset", pageReset],
   restore: ["Restore", (view) => pageNotice(view, "Restore", "Database restore stays on the Laravel operator page. It reloads a dump taken by Reset.")],
 };
 
 function render() {
   const here = path() || "dashboard";
+  if (here === "unclaimed") {
+    location.replace("#/unclaim");
+    return;
+  }
   if (here === "login" || here === "logout") {
     if (here === "logout") writeSession(null);
     loginPage();

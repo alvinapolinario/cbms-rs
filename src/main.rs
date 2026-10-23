@@ -36,6 +36,7 @@ async fn main() -> anyhow::Result<()> {
 
     let config = config::Config::from_env();
     let db = db::connect(&config.database_url).await?;
+    services::ledger::ensure_table(&db).await?;
     tracing::info!("connected to database");
 
     let addr = format!("{}:{}", config.host, config.port);

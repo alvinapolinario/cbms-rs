@@ -69,6 +69,42 @@ pub struct LedgerMeta<'a> {
     pub source_id: Option<i32>,
 }
 
+/// Imported Laravel databases have no `teller_ledger`. `create_bet` writes a line inside the
+/// bet transaction, so a missing table rolls the receipt back and the teller app shows failure.
+/// `CREATE TABLE` is not allowed inside that transaction (MySQL commits implicitly), so this
+/// runs once at startup.
+pub async fn ensure_table(pool: &crate::db::DbPool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS teller_ledger (
+            ledger_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            event_id INT NOT NULL,
+            event_teller_id INT NOT NULL,
+            line_no INT UNSIGNED NOT NULL,
+            entry_at DATETIME NOT NULL,
+            type VARCHAR(32) NOT NULL,
+            fight_no INT NULL,
+            match_id INT NULL,
+            reference VARCHAR(60) NULL,
+            amount_in DECIMAL(16,2) NOT NULL,
+            amount_out DECIMAL(16,2) NOT NULL,
+            balance_before DECIMAL(16,2) NOT NULL,
+            balance_after DECIMAL(16,2) NOT NULL,
+            related_event_teller_id INT NULL,
+            recorded_by_account_id INT NULL,
+            approved_by_account_id INT NULL,
+            note VARCHAR(255) NULL,
+            source_table VARCHAR(64) NULL,
+            source_id INT NULL,
+            PRIMARY KEY (ledger_id),
+            UNIQUE KEY teller_ledger_line (event_teller_id, line_no),
+            KEY teller_ledger_event (event_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Writes one ledger line. Must run on a connection that is inside the same transaction as the
 /// balance change, and after that change was applied -- callers pass `&mut *tx` (reborrowed from
 /// an open `sqlx::Transaction`).

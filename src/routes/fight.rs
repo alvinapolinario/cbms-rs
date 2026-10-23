@@ -176,11 +176,19 @@ pub async fn tv_board(State(state): State<Arc<AppState>>) -> Response {
     .await
     .ok()
     .flatten();
-    let matches = sqlx::query_as::<_, Fight>("SELECT * FROM matches WHERE event_id = ? ORDER BY match_number DESC")
-        .bind(event_id)
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
+    let matches = match sqlx::query_as::<_, Fight>(
+        "SELECT * FROM matches WHERE event_id = ? ORDER BY match_number DESC",
+    )
+    .bind(event_id)
+    .fetch_all(&state.db)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(error = %e, "tv board fights");
+            Vec::new()
+        }
+    };
     Json(json!({
         "success": true,
         "event": { "event_id": event_id, "event_name": event_name },
@@ -562,8 +570,12 @@ pub async fn update_match_bet_status(
         return AppError::internal(e).into_response();
     }
 
-    crate::services::realtime::match_updated(&state, body.match_id).await;
-    crate::services::realtime::tv_display(&state, body.match_id).await;
+    let broadcast = Arc::clone(&state);
+    let match_id = body.match_id;
+    tokio::spawn(async move {
+        crate::services::realtime::match_updated(&broadcast, match_id).await;
+        crate::services::realtime::tv_display(&broadcast, match_id).await;
+    });
 
     Json(json!({ "message": format!("Fight #{} bet status updated to {}!", updated.match_number, updated.match_bet_status) })).into_response()
 }
@@ -742,7 +754,6 @@ pub async fn update_match_status(
         return AppError::internal(e).into_response();
     }
 
-    crate::services::realtime::tv_display(&state, body.match_id).await;
     if !body.dont_create {
         if let Ok(mut tx2) = state.db.begin().await {
             if new_static_match(&mut tx2, target.event_id).await.is_ok() {
@@ -750,9 +761,15 @@ pub async fn update_match_status(
             }
         }
     }
-    crate::services::realtime::latest_match_updated(&state, target.event_id).await;
-    crate::services::realtime::fight_history(&state, target.event_id).await;
-    crate::services::realtime::teller_balances(&state, target.event_id).await;
+    let broadcast = Arc::clone(&state);
+    let match_id = body.match_id;
+    let event_id = target.event_id;
+    tokio::spawn(async move {
+        crate::services::realtime::tv_display(&broadcast, match_id).await;
+        crate::services::realtime::latest_match_updated(&broadcast, event_id).await;
+        crate::services::realtime::fight_history(&broadcast, event_id).await;
+        crate::services::realtime::teller_balances(&broadcast, event_id).await;
+    });
 
     Json(json!({ "message": format!("Fight #{match_number} match status updated to {}!", body.match_status) })).into_response()
 }

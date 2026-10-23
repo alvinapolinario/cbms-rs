@@ -51,7 +51,7 @@ pub async fn claim_winning(
 
     let mut tx = match state.db.begin().await {
         Ok(tx) => tx,
-        Err(e) => return soft_fail(&format!("{e}")),
+        Err(e) => return soft_fail(&crate::error::log_fault(&e)),
     };
 
     let bet_row = sqlx::query("SELECT * FROM bets WHERE bet_receipt_code = ? FOR UPDATE")
@@ -119,7 +119,7 @@ pub async fn claim_winning(
     match deducted {
         Ok(r) if r.rows_affected() == 1 => {}
         Ok(_) => return soft_fail("Insufficient cash on hand. Please request a cash-in from the administrator."),
-        Err(e) => return soft_fail(&format!("{e}")),
+        Err(e) => return soft_fail(&crate::error::log_fault(&e)),
     }
 
     let now = DbDateTime::now();
@@ -135,7 +135,7 @@ pub async fn claim_winning(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "success": false, "message": "Something went wrong! Please try again!", "error": format!("{e}") })),
+                Json(json!({ "success": false, "message": "Something went wrong! Please try again!", "error": crate::error::log_fault(&e) })),
             )
                 .into_response()
         }
@@ -148,7 +148,7 @@ pub async fn claim_winning(
         .execute(&mut *tx)
         .await
     {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": format!("{e}") }))).into_response();
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": crate::error::log_fault(&e) }))).into_response();
     }
 
     let fight_no: Option<i32> = sqlx::query_scalar("SELECT match_number FROM matches WHERE match_id = ?")
@@ -189,7 +189,7 @@ pub async fn claim_winning(
     )
     .await
     {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": format!("{e}") }))).into_response();
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": crate::error::log_fault(&e) }))).into_response();
     }
 
     let teller_name: Option<String> = sqlx::query_scalar("SELECT teller_name FROM tellers t JOIN event_tellers et ON et.teller_id = t.teller_id WHERE et.event_teller_id = ?")
@@ -201,7 +201,7 @@ pub async fn claim_winning(
     create_log(&mut *tx, teller.account_id, "Teller App", "Bet payout claimed.").await;
 
     if let Err(e) = tx.commit().await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": format!("{e}") }))).into_response();
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "success": false, "message": crate::error::log_fault(&e) }))).into_response();
     }
 
     crate::services::realtime::teller_balances(&state, teller.event_id).await;
